@@ -1,3 +1,9 @@
+-technical post-
+
+https://zhuanlan.zhihu.com/p/560729749
+
+-info-
+
 shape : 16384, 16384, 16384
 
 dtype: float32
@@ -11,6 +17,8 @@ tvm version: 10.0
 cutlass baseline: 421 ms
 
 cublas baseline: 420 ms
+
+-result-
 
 0.native_gemm.py：
 
