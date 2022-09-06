@@ -1,9 +1,6 @@
 from concurrent.futures import thread
 import tvm
 from tvm import te
-import os
-from tvm.contrib import nvcc
-from tvm.contrib import spirv
 import numpy as np
 import tvm.testing
 
