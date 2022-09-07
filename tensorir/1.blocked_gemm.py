@@ -46,7 +46,7 @@ class MyModule:
         B = T.match_buffer(b, [K, N])
         C = T.match_buffer(c, [M, N])
 
-        for i, j, k in T.grid(M, K, N):
+        for i, j, k in T.grid(M, N, K):
             with T.block("B"):
                 vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
@@ -56,7 +56,6 @@ class MyModule:
 
 ir_module = MyModule
 sch = tvm.tir.Schedule(ir_module)
-
 block_h = 32
 block_w = 32
 
@@ -74,7 +73,7 @@ sch.bind(yi, "threadIdx.y")
 sch.bind(xi, "threadIdx.x")
 
 block_cl = sch.cache_write(block_b, 0, "local")
-sch.reverse_compute_at(block_cl, yi, preserve_unit_loops=True)
+sch.reverse_compute_at(block_cl, xi, preserve_unit_loops=True)
 
 write_code(sch.mod.astext(), "1.cache_write.cu")
 

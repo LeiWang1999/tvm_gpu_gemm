@@ -48,6 +48,9 @@ print(type(ir_module))
 print(ir_module.script())
 
 
+'''
+read_buffer_index : 0->A 1->B
+'''
 block_b = sch.get_block("B")
 block_shared_A = sch.cache_read(block_b, 0, "shared")
 block_local_A = sch.cache_read(block_b, 0, "local")

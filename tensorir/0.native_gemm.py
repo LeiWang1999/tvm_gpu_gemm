@@ -64,7 +64,7 @@ class MyModule:
         B = T.match_buffer(b, [K, N])
         C = T.match_buffer(c, [M, N])
 
-        for i, j, k in T.grid(M, K, N):
+        for i, j, k in T.grid(M, N, K):
             with T.block("B"):
                 vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
