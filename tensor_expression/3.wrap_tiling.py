@@ -76,7 +76,7 @@ def test_gemm():
     s[C].bind(ty, thread_y)
     s[C].bind(tx, thread_x)
     # s[C].reorder(ty, tx, xi, yi)
-    s[C].reorder(tyz, txz, ty, tx, xi, yi)
+    s[C].reorder(tyz, txz, ty, tx, yi, xi)
 
     write_code(
         str(tvm.lower(s, [A, B, C], simple_mode=True)), "progress/5.bind_thread.cu")

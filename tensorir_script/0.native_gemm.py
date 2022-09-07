@@ -16,15 +16,12 @@
 # under the License.
 
 """Example code to do square matrix multiplication."""
-from asyncore import write
+
 import tvm
-from tvm import te
-import os
-from tvm.contrib import nvcc
-from tvm.contrib import spirv
 import numpy as np
 import tvm.testing
 from tvm.script import tir as T
+
 
 _dtype = "float32"
 
@@ -55,6 +52,7 @@ M = N = K = 1024
 #                             C[vi, vj] = 0.0
 #                         C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vk, vj]
 
+
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
@@ -71,17 +69,22 @@ class MyModule:
                     C[vi, vj] = 0.0
                 C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vk, vj]
 
+
+
 ir_module = MyModule
-sch = tvm.tir.Schedule(ir_module)
+sch = tvm.tir.Schedule(ir_module, debug_mask="all")
 
 print(type(ir_module))
 print(ir_module.script())
 
+write_code(sch.mod.astext(), "0.original.cu")
 block_b = sch.get_block("B")
 (i, j, k) = sch.get_loops(block_b)
 sch.bind(i, "blockIdx.x")
 sch.bind(j, "threadIdx.x")
 
+
+write_code(sch.mod.astext(), "1.thread_bind.cu")
 
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
