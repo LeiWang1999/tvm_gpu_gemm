@@ -41,8 +41,8 @@
         }
       }
     }
-    attr [IterVar(blockIdx.y, (nullptr), "ThreadIndex", "blockIdx.y")] "thread_extent" = 128;
     attr [IterVar(blockIdx.x, (nullptr), "ThreadIndex", "blockIdx.x")] "thread_extent" = 128;
+    attr [IterVar(blockIdx.y, (nullptr), "ThreadIndex", "blockIdx.y")] "thread_extent" = 128;
     for (ii.inner: int32, 0, 128) {
       for (jj.inner: int32, 0, 128) {
         C[((((blockIdx.x*2097152) + (ii.inner*16384)) + (blockIdx.y*128)) + jj.inner)] = C.local_1[((ii.inner*128) + jj.inner)]
