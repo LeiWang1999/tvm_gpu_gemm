@@ -1,6 +1,7 @@
--technical post-
+-post-
 
-https://zhuanlan.zhihu.com/p/560729749
+- [tensor expression efficient fp32 gemm](https://zhuanlan.zhihu.com/p/560729749)
+- [TIR Script efficient fp32 gemm](https://zhuanlan.zhihu.com/p/562360659)
 
 -info-
 
