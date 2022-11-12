@@ -3,6 +3,44 @@ import tvm
 from tvm import te
 
 
+def intrin_wmma_load_matrix(shape, scope):
+    n, m, l = shape
+    if scope == "wmma.matrix_a":
+        row, col = n, l
+    elif scope == "wmma.matrix_b":
+        row, col = l, m
+    A = te.placeholder((row, col), name="A", dtype="float16")
+    BA = tvm.tir.decl_buffer(
+        A.shape, A.dtype, scope="shared", data_alignment=32, offset_factor=row * col
+    )
+    C = te.compute((row, col), lambda i, j: A[i, j], name="C")
+    BC = tvm.tir.decl_buffer(
+        C.shape, C.dtype, scope=scope, data_alignment=32, offset_factor=row * col
+    )
+
+    def intrin_func(ins, outs):
+        ib = tvm.tir.ir_builder.create()
+
+        BA = ins[0]
+        BC = outs[0]
+        ib.emit(
+            tvm.tir.call_intrin(
+                "handle",
+                "tir.tvm_load_matrix_sync",
+                BC.data,
+                n,
+                m,
+                l,
+                BC.elem_offset // (row * col),
+                BA.access_ptr("r"),
+                col,
+                "row_major",
+            )
+        )
+        return ib.get()
+
+    return te.decl_tensor_intrin(C.op, intrin_func, binds={A: BA, C: BC})
+
 
 def intrin_wmma_load_matrix_A(strides_dst, strides_from, shape, layout, A_shape, C_shape, in_dtype):
     """Intrin function for loading data from shared memory to wmma.matrix_a"""
@@ -93,7 +131,7 @@ def intrin_wmma_load_matrix_W(strides_dst, strides_from, shape, layout, A_shape,
 
 
 def intrin_wmma_store_matrix(strides_dst, strides_from, shape, out_dtype, A_shape, C_shape):
-    """Intrin function for storing the results from wmma.accumulator to shared"""
+    """Intrin function for storing the results from wmma.accumulator to global"""
     wmma_m, wmma_n, wmma_k = shape
     A = te.placeholder(A_shape, name="A", dtype=out_dtype)
     BA = tvm.tir.decl_buffer(
@@ -106,7 +144,7 @@ def intrin_wmma_store_matrix(strides_dst, strides_from, shape, out_dtype, A_shap
     )
     C = te.compute(C_shape, lambda *i: A(*i), name="C")
     BC = tvm.tir.decl_buffer(
-        C.shape, C.dtype, scope="shared", strides=strides_dst, data_alignment=32, offset_factor=8
+        C.shape, C.dtype, scope="global", strides=strides_dst, data_alignment=32, offset_factor=8
     )
 
     def intrin_func(ins, outs):

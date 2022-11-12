@@ -3,12 +3,151 @@ import tvm
 from tvm import te
 import numpy as np
 import tvm.testing
-from intrin_wmma import (
-    intrin_wmma_load_matrix_A,
-    intrin_wmma_load_matrix_W,
-    intrin_wmma_store_matrix,
-    intrin_wmma_gemm,
-)
+
+
+def intrin_wmma_load_matrix(shape, strides_dst, strides_from, scope):
+    n, m, l = shape
+    if scope == "wmma.matrix_a":
+        row, col = n, l
+    elif scope == "wmma.matrix_b":
+        row, col = l, m
+    A = te.placeholder((row, col), name="A", dtype="float16")
+    BA = tvm.tir.decl_buffer(
+        A.shape, A.dtype, scope="shared", strides=strides_from, data_alignment=32, offset_factor=row * col
+    )
+    C = te.compute((row, col), lambda i, j: A[i, j], name="C")
+    BC = tvm.tir.decl_buffer(
+        C.shape, C.dtype, scope=scope, strides=strides_dst, data_alignment=32, offset_factor=row * col
+    )
+
+    def intrin_func(ins, outs):
+        ib = tvm.tir.ir_builder.create()
+
+        BA = ins[0]
+        BC = outs[0]
+        ib.emit(
+            tvm.tir.call_intrin(
+                "handle",
+                "tir.tvm_load_matrix_sync",
+                BC.data,
+                n,
+                m,
+                l,
+                BC.elem_offset // (row * col),
+                BA.access_ptr("r"),
+                col,
+                "row_major",
+            )
+        )
+        return ib.get()
+
+    return te.decl_tensor_intrin(C.op, intrin_func, binds={A: BA, C: BC})
+
+
+def intrin_wmma_gemm(shape, strides_A, strides_B, strides_C):
+    n, m, l = shape
+    A = te.placeholder((n, l), name="A", dtype="float16")
+    B = te.placeholder((l, m), name="B", dtype="float16")
+    k = te.reduce_axis((0, l), name="k")
+    C = te.compute(
+        (n, m),
+        lambda ii, jj: te.sum(A[ii, k].astype(
+            "float") * B[k, jj].astype("float"), axis=k),
+        name="C",
+    )
+    BA = tvm.tir.decl_buffer(
+        A.shape, A.dtype, name="BA", scope="wmma.matrix_a", strides=strides_A,data_alignment=32, offset_factor=n * l
+    )
+    BB = tvm.tir.decl_buffer(
+        B.shape, B.dtype, name="BB", scope="wmma.matrix_b", strides=strides_B,data_alignment=32, offset_factor=l * m
+    )
+    BC = tvm.tir.decl_buffer(
+        C.shape,
+        C.dtype,
+        name="BC",
+        scope="wmma.accumulator",
+        strides=strides_C,
+        data_alignment=32,
+        offset_factor=n * m,
+    )
+
+    def intrin_func(ins, outs):
+        BA, BB = ins
+        (BC,) = outs
+
+        def init():
+            ib = tvm.tir.ir_builder.create()
+            ib.emit(
+                tvm.tir.call_intrin(
+                    "handle",
+                    "tir.tvm_fill_fragment",
+                    BC.data,
+                    n,
+                    m,
+                    l,
+                    BC.elem_offset // (n * m),
+                    0.0,
+                )
+            )
+            return ib.get()
+
+        def update():
+            ib = tvm.tir.ir_builder.create()
+            ib.emit(
+                tvm.tir.call_intrin(
+                    "handle",
+                    "tir.tvm_mma_sync",
+                    BC.data,
+                    BC.elem_offset // (n * m),
+                    BA.data,
+                    BA.elem_offset // (n * l),
+                    BB.data,
+                    BB.elem_offset // (l * m),
+                    BC.data,
+                    BC.elem_offset // (n * m),
+                )
+            )
+            return ib.get()
+
+        return update(), init(), update()
+
+    return te.decl_tensor_intrin(C.op, intrin_func, binds={A: BA, B: BB, C: BC})
+
+
+def intrin_wmma_store_matrix(shape, strides_dst, strides_from):
+    n, m, l = shape
+    A = te.placeholder((n, m), name="A", dtype="float32")
+    BA = tvm.tir.decl_buffer(
+        A.shape, A.dtype, scope="wmma.accumulator", strides=strides_from,data_alignment=32, offset_factor=n * m
+    )
+    C = te.compute((n, m), lambda i, j: A[i, j], name="C")
+    BC = tvm.tir.decl_buffer(
+        C.shape, C.dtype, scope="global", strides=strides_dst, data_alignment=32, offset_factor=n * m
+    )
+
+    def intrin_func(ins, outs):
+        ib = tvm.tir.ir_builder.create()
+
+        BA = ins[0]
+        BC = outs[0]
+        ib.emit(
+            tvm.tir.call_intrin(
+                "handle",
+                "tir.tvm_store_matrix_sync",
+                BA.data,
+                n,
+                m,
+                l,
+                BA.elem_offset // (n * m),
+                BC.access_ptr("w"),
+                m,
+                "row_major",
+            )
+        )
+        return ib.get()
+
+    return te.decl_tensor_intrin(C.op, intrin_func, binds={A: BA, C: BC})
+
 
 TASK = "gemm"
 USE_MANUAL_CODE = False
@@ -28,9 +167,9 @@ def write_code(code, path, fname):
 def test_gemm():
     log_path = "progress/tensorize_wmma/fp16_wmma_m64n64k16_nn"
     # graph
-    m = 16
-    n = 16
-    k = 16
+    m = 1024
+    n = 1024
+    k = 1024
 
     A = te.placeholder((m, k), dtype=_dtype, name="A")
     B = te.placeholder((k, n), dtype=_dtype, name="B")
@@ -62,46 +201,42 @@ def test_gemm():
     thread_z = te.thread_axis("threadIdx.z")
 
     warp_size = 32
-    block_row_warps = 1
-    block_col_warps = 1
-    warp_row_tiles = 1
-    warp_col_tiles = 1
-    wmma_m = 16
-    wmma_n = 16
+    block_row_warps = 2
+    block_col_warps = 4
+    warp_row_tiles = 4
+    warp_col_tiles = 2
+    wmma_m = 32
+    wmma_n = 8
     wmma_k = 16
     vec = 8
-    chunk = 1
+    chunk = 4
     offset = 0
     offsetCS = 0
 
+    shape = (wmma_m, wmma_n, wmma_k)
     BM = wmma_m * warp_row_tiles * block_row_warps
     BN = wmma_n * warp_col_tiles * block_col_warps
-    AS_factor = chunk * wmma_k
-    AS_offset = offset
-    BS_factor = chunk * wmma_n
-    BS_offset = offset
 
-    AS_align = chunk * wmma_k + offset
-    BS_align = chunk * wmma_k + offset
-    CS_align = warp_col_tiles * block_col_warps * wmma_n + offsetCS
 
+    
     _m, _n = C.op.axis
-    by, bm = s[C].split(_m, factor=BM)
-    bx, bn = s[C].split(_n, factor=BN)
-    s[C].reorder(by, bx, bm, bn)
+    # compute_at
+    bb, kernel_i = s[C].split(_m, factor=wmma_m)
+    oo, kernel_j = s[C].split(_n, factor=wmma_n)
+    s[C].reorder(bb, oo, kernel_i, kernel_j)
+
+    bb, ii = s[C].split(bb, factor=warp_row_tiles)
+    bx, bb = s[C].split(bb, factor=block_row_warps)
+    oo, jj = s[C].split(oo, factor=warp_col_tiles)
+    by, oo = s[C].split(oo, factor=block_col_warps)
+    s[C].reorder(bx, by, bb, oo, ii, jj, kernel_i, kernel_j)
+    
     s[C].bind(by, block_y)
     s[C].bind(bx, block_x)
-
-    # compute_at
-    bb, bbi = s[C].split(bm, factor=wmma_m)
-    oo, ooi = s[C].split(bn, factor=wmma_n)
-    bb, bbii = s[C].split(bb, factor=warp_row_tiles)
-    oo, ooii = s[C].split(oo, factor=warp_col_tiles)
-    s[C].reorder(bb, oo, bbii, ooii, bbi, ooi)
-    s[C].bind(bb, thread_z)
-    s[C].bind(oo, thread_y)
+    s[C].bind(bb, thread_y)
+    s[C].bind(oo, thread_z)
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "5.bind_c.cu")
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "3.bind_c.cu")
 
     # Schedule for wmma computation
     s[CF].compute_at(s[C], oo)
@@ -114,116 +249,77 @@ def test_gemm():
     ko, ki = s[CF].split(rk, factor=chunk)
     s[CF].reorder(ko, ki, warp_i, warp_j, _ii, _jj, _rk)
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "5.bind_cf.cu")
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "3.bind_cf.cu")
 
     # Schedule for  wmma_matrix_a load
     s[AF].compute_at(s[CF], ki)
+    write_code(
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "5.bind_af.cu")
     b, i = AF.op.axis
     b, b_ii = s[AF].split(b, factor=wmma_m)
     i, i_jj = s[AF].split(i, factor=wmma_k)
     s[AF].reorder(b, i, b_ii, i_jj)
-    write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "5.bind_af.cu")
+
+    
     # Schedule for  wmma_matrix_b load
     s[BF].compute_at(s[CF], ki)
     o, i = BF.op.axis
-    o, o_ii = s[BF].split(o, factor=wmma_n)
-    i, i_ii = s[BF].split(i, factor=wmma_k)
+    o, o_ii = s[BF].split(o, factor=wmma_k)
+    i, i_ii = s[BF].split(i, factor=wmma_n)
     s[BF].reorder(o, i, o_ii, i_ii)
     write_code(
         str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "5.bind_bf.cu")
 
     # Schedule for A's(B's) shared memory load
-    def shared_schedule(stage):
+    def shared_schedule(stage, shape):
         s[stage].compute_at(s[CF], ko)
         xo, yo = stage.op.axis
-        t = s[stage].fuse(xo, yo)
-        t, vi = s[stage].split(t, factor=vec)
-        t, tx = s[stage].split(t, factor=warp_size)
-        t, ty = s[stage].split(t, factor=block_row_warps)
-        _, tz = s[stage].split(t, factor=block_col_warps)
+        xo, xi = s[stage].split(xo, factor=shape[0])
+        yo, yi = s[stage].split(yo, factor=shape[1])
+        s[stage].reorder(xo, yo, xi, yi)
+        
+        ty, xo = s[stage].split(xo, nparts=block_row_warps)
+        tz, yo = s[stage].split(yo, nparts=block_col_warps)
+        fused_xi_yi = s[stage].fuse(xi, yi)
+        tx, fused_xi_yi = s[stage].split(fused_xi_yi, nparts=warp_size)
+        # t, vi = s[stage].split(t, factor=vec)
         s[stage].bind(ty, thread_y)
         s[stage].bind(tz, thread_z)
         s[stage].bind(tx, thread_x)
-        s[stage].vectorize(vi)
+        # s[stage].vectorize(vi)
 
-    shared_schedule(AS)
-    shared_schedule(BS)
+    shared_schedule(AS, (wmma_m, wmma_k))
+    shared_schedule(BS, (wmma_k, wmma_n))
     write_code(
         str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "7.shared_schedule.cu")
 
-    # Tensorize
+    # Tensorize    
+    AS_align = chunk * wmma_k + offset
+    BS_align = chunk * wmma_k + offset
+    C_align = warp_col_tiles * block_col_warps * wmma_m + offsetCS
     AS_stride = [AS_align, 1]
     BS_stride = [BS_align, 1]
     AF_stride = [wmma_k, 1]
     BF_stride = [wmma_k, 1]
     CF_stride = [warp_col_tiles * wmma_n, 1]
-    CS_stride = [CS_align, 1]
-    shape = (wmma_m, wmma_n, wmma_k)
-    AL_gemm = te.placeholder(
-        (wmma_m, wmma_k), name="AL_gemm", dtype="float16")
-    BL_gemm = te.placeholder(
-        (wmma_n, wmma_k), name="BL_gemm", dtype="float16")
-    k_gemm = te.reduce_axis((0, wmma_k), name="k_gemm")
-    CL_compute = te.compute(
-        (wmma_m, wmma_n),
-        lambda ii, jj: te.sum(
-            AL_gemm[ii, k_gemm].astype(
-                "float32") * BL_gemm[k_gemm, jj].astype("float32"),
-            axis=k_gemm,
-        ),
-        name="CL_compute")
-    write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path, "3.before_tensorize.cu")
-
-    intrin_wmma_load_matrix_a = intrin_wmma_load_matrix_A(
-        AF_stride,
-        AS_stride,
-        shape,
-        "row_major",
-        (wmma_m, wmma_k),
-        (wmma_m, wmma_k),
-        "float16",
-    )
-
-    intrin_wmma_load_matrix_b = intrin_wmma_load_matrix_W(
-        BF_stride,
-        BS_stride,
-        shape,
-        "row_major",
-        (wmma_n, wmma_k),
-        (wmma_n, wmma_k),
-        "float16",
-    )
-
+    C_stride = [C_align, 1]
+    
     s[AF].tensorize(
-        b_ii,
-        intrin_wmma_load_matrix_a,
-    )
+        b_ii, intrin_wmma_load_matrix(shape, AF_stride, AS_stride, "wmma.matrix_a"))
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path, "4.bind_intrin_load_matrix_A.cu")
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "8.tensorize_load_A.cu")
     s[BF].tensorize(
-        o_ii,
-        intrin_wmma_load_matrix_b
-    )
+        o_ii, intrin_wmma_load_matrix(shape, BF_stride, BS_stride, "wmma.matrix_b"))
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path, "5.bind_intrin_load_matrix_B.cu")
-    s[CF].tensorize(
-        _ii,
-        intrin_wmma_gemm(AL_gemm, BL_gemm, CL_compute,
-                         AF_stride, BF_stride, CF_stride, shape),
-    )
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "8.tensorize_load_B.cu")
+    s[CF].tensorize(_ii, intrin_wmma_gemm(
+        shape, AF_stride, BF_stride, CF_stride))
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path, "6.intrin_wmma_gemm.cu")
-    s[C].tensorize(
-        bbi,
-        intrin_wmma_store_matrix(
-            CS_stride, CF_stride, shape, "float32", (
-                wmma_m, wmma_n), (wmma_m, wmma_n)
-        ),
-    )
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "8.tensorize_gemm.cu")
+    s[C].tensorize(kernel_i, intrin_wmma_store_matrix(
+        shape, C_stride, CF_stride))
     write_code(
-        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path, "7.intrin_wmma_store_matrix.cu")
+        str(tvm.lower(s, [A, B, C], simple_mode=True)), log_path,  "8.final_stmt.cu")
 
     device = 'cuda -arch=sm_80'
     dev = tvm.device(device, 0)
