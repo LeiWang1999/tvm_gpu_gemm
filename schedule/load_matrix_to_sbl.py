@@ -23,7 +23,7 @@ def intrin_load_matrix_to_slb():
 
         tx = te.thread_axis("threadIdx.x")
         ib.scope_attr(tx, "thread_extent", 64)
-        index = tx // 2
+        index = tx // 1
 
         for outer in range(0, 16):
             ib.emit(BC.vstore([outer, index], BA.vload(
@@ -59,7 +59,7 @@ s[AS].tensorize(ax, intrin_load_matrix_to_slb())
 print(tvm.lower(s, [A, B]))
 
 f = tvm.build(s, [A, B], "cuda")
-
+print(f.imported_modules[0].get_source())
 ctx = tvm.gpu(0)
 a = tvm.nd.array(np.random.uniform(size=(M, N)).astype(A.dtype), ctx)
 b = tvm.nd.array(np.zeros((M, N), dtype=B.dtype), ctx)
