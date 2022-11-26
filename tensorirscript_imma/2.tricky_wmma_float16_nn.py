@@ -14,8 +14,6 @@ from tvm.tir.tensor_intrin.cuda import (
 
 log_path = "progress/tensorscript_imma/2.tricky_wmma_float16_nn"
 count = 0
-
-
 def write_code(code, path, fname):
     global count
     # if path not exist, create it
@@ -35,9 +33,16 @@ def write_sch(sch, path, fname):
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
 
+
+VERIFY = True
+
 M = 16384
 N = 16384
 K = 16384
+if VERIFY:
+    M = 256
+    N = 256
+    K = 256
 warp_size = 32
 block_row_warps = 4
 block_col_warps = 2
@@ -156,12 +161,23 @@ ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
-
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16"), ctx)
+a_np = np.random.uniform(
+    size=(M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
+b_np = np.random.uniform(
+    size=(K // wmma_k, N // wmma_n, wmma_k, wmma_n)).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float32"), ctx)
-cuda_mod(cuda_a, cuda_b, cuda_c)
+
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
+    b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
+    c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    np.testing.assert_allclose(
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e-1, atol=1e-1
+    )
 
 num_flops = 2 * M * K * N
 num_runs = 1

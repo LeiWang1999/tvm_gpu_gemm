@@ -34,7 +34,7 @@ from tvm.tir.tensor_intrin.cuda import (
 )
 
 
-log_path = "progress/tensorirscript_imma/5.padding_mma_i32_nt"
+log_path = "progress/tensorirscript_imma/7.padding_mma_f16_nt"
 count = 0
 def write_code(code, path, fname):
     global count
@@ -65,9 +65,9 @@ if VERIFY:
     N = 256
     K = 256
 
-BM = 128
-BN = 256
-BK = 64
+BM = 256
+BN = 128
+BK = 32
 warp_size = 32
 block_row_warps = 2
 block_col_warps = 4
@@ -77,17 +77,17 @@ class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [N, K], dtype="int8")
-        C = T.match_buffer(c, [M, N], dtype="int32")
+        A = T.match_buffer(a, [M, K], dtype="float16")
+        B = T.match_buffer(b, [N, K], dtype="float16")
+        C = T.match_buffer(c, [M, N], dtype="float16")
 
         for i, j, k in T.grid(M, N, K):
             with T.block("B"):
                 vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
-                    C[vi, vj] = T.int32(0)
+                    C[vi, vj] = T.float16(0)
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("int32") * B[vj, vk].astype("int32")
+                    A[vi, vk].astype("float16") * B[vj, vk].astype("float16")
 
 
 ir_module = MyModule
@@ -140,14 +140,14 @@ write_sch(sch, log_path, "thread_bind")
 def fetch_to_shared(block, idx):
     block_read = sch.cache_read(block, idx, "shared")
     sch.compute_at(block_read, bk)
-    vector_size = 16
+    vector_size = 8
     fused = sch.fuse(*sch.get_loops(block_read)[-2:])
     _, f_1, f_2, f_3 = sch.split(
         fused, factors=[None, block_col_warps, warp_size, vector_size])
     sch.bind(f_2, "threadIdx.x")
     sch.bind(f_1, "threadIdx.y")
     sch.vectorize(f_3)
-    offset = 0
+    offset = 8
     sch.storage_align(block_read, 0, axis=-2, factor=32, offset=offset)
 
 # schedule A
@@ -161,7 +161,7 @@ write_sch(sch, log_path, "shared_memory_schedule")
 
 mma_m = 16
 mma_n = 16
-mma_k = 32
+mma_k = 16
 
 block_b_inner_i, block_b_inner_i_tc = sch.split(
     block_b_inner_i, factors=[None, mma_m])
@@ -212,24 +212,24 @@ write_sch(sch, log_path, "decompose_reduction")
 
 def index_map_A(i, j):
     return (
-        i // 16,
-        j // 32,
-        *shared_16x32_to_ldmatrix_32x16_layout(i % 16, j % 32),
-    )
+            i // 16,
+            j // 16,
+            *shared_16x16_to_ldmatrix_32x8_layout(i % 16, j % 16),
+        )
 
 def index_map_B(i, j):
     return (
-        i // 32,
-        j // 16,
-        *shared_32x16_to_ldmatrix_32x16_layout(i % 32, j % 16),
-    )
+            i // 16,
+            j // 16,
+            *shared_16x16_to_ldmatrix_32x8_layout(i % 16, j % 16),
+        )
 
 def index_map_C(i, j):
     return (
-        i // 16,
-        j // 16,
-        *shared_16x16_to_ldmatrix_32x8_layout(i % 16, j % 16),
-    )
+            i // 16,
+            j // 16,
+            *shared_16x16_to_ldmatrix_32x8_layout(i % 16, j % 16),
+        )
 
 
 sch.transform_layout(A_warp, ("write", 0), index_map_A)
@@ -238,43 +238,37 @@ sch.transform_layout(C_warp, ("read", 0), index_map_C)
 
 write_sch(sch, log_path, "transform_layout")
 
-sch.tensorize(loop_a, LDMATRIX_16x32_A_INTRIN)
-sch.tensorize(loop_b, LDMATRIX_16x32_B_TRANS_INTRIN)
+sch.tensorize(loop_a, LDMATRIX_16x16_A_INTRIN)
+sch.tensorize(loop_b, LDMATRIX_16x16_B_TRANS_INTRIN)
 write_sch(sch, log_path, "tensorize_ldmatrix")
 
-# _test_block = sch.get_block("")
-sch.tensorize(block_b_inner_i_tc, MMA_i8i8i32_TRANS_INTRIN)
+sch.tensorize(block_b_inner_i_tc, MMA_f16f16f16_TRANS_INTRIN)
+write_sch(sch, log_path, "tensorize_mma_sync")
 
-sch.tensorize(sch.get_loops(block_init_c)[-2], MMA_fill_16x16_i32_INTRIN)
-sch.tensorize(sch.get_loops(C_warp)[-2], MMA_store_16x16_i32_global_INTRIN)
+sch.tensorize(sch.get_loops(block_init_c)[-2], MMA_fill_16x16_f16_INTRIN)
+write_sch(sch, log_path, "tensorize_mma_fill")
 
-write_sch(sch, log_path, "tensorize")
+sch.tensorize(sch.get_loops(C_warp)[-2], MMA_store_16x16_f16_global_INTRIN)
+write_sch(sch, log_path, "tensorize_store")
 
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
-a_np = (np.random.uniform(
-    size=(M, K)) * 256 - 128).astype("int8")
-b_np = (np.random.uniform(
-    size=(K, N)) * 256 - 128).astype("int8")
-cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
-cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
-cuda_c = tvm.nd.array(
-    np.zeros((M, N)).astype("int32"), ctx)
 
-print(a_np)
-print('=====================')
-print(b_np)
+a_np = (np.random.rand(
+    M, K)).astype("float16")
+b_np = (np.random.rand(K, N)).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
+cuda_c = tvm.nd.array(
+    np.zeros((M, N)).astype("float16"), ctx)
 
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
-    print(c_np)
-    print('=====================')
-    print(np.matmul(a_np.astype("int8"), b_np.astype("int8")))
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("int8"), b_np.astype("int8")), rtol=1e-1, atol=1e-1
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e0, atol=1e0
     )
 
 num_flops = 2 * M * K * N

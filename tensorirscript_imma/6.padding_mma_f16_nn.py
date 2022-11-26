@@ -55,9 +55,16 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
+VERIFY = True
+
 M = 16384
 N = 16384
 K = 16384
+if VERIFY:
+    M = 256
+    N = 256
+    K = 256
+
 BM = 256
 BN = 128
 BK = 32
@@ -71,7 +78,7 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M, K], dtype="float16")
-        B = T.match_buffer(b, [N, K], dtype="float16")
+        B = T.match_buffer(b, [K, N], dtype="float16")
         C = T.match_buffer(c, [M, N], dtype="float16")
 
         for i, j, k in T.grid(M, N, K):
@@ -80,7 +87,7 @@ class MyModule:
                 with T.init():
                     C[vi, vj] = T.float16(0)
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("float16") * B[vj, vk].astype("float16")
+                    A[vi, vk].astype("float16") * B[vk, vj].astype("float16")
 
 
 ir_module = MyModule
@@ -235,7 +242,7 @@ sch.tensorize(loop_a, LDMATRIX_16x16_A_INTRIN)
 sch.tensorize(loop_b, LDMATRIX_16x16_B_INTRIN)
 write_sch(sch, log_path, "tensorize_ldmatrix")
 
-sch.tensorize(block_b_inner_i_tc, MMA_f16f16f16_TRANS_INTRIN)
+sch.tensorize(block_b_inner_i_tc, MMA_f16f16f16_INTRIN)
 write_sch(sch, log_path, "tensorize_mma_sync")
 
 sch.tensorize(sch.get_loops(block_init_c)[-2], MMA_fill_16x16_f16_INTRIN)
@@ -249,10 +256,20 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(K * N).reshape((K, N)).astype("float16"), ctx)
-cuda_c = tvm.nd.array(np.zeros((M, N)).astype("float16"), ctx)
-cuda_mod(cuda_a, cuda_b, cuda_c)
+a_np = (np.random.rand(
+    M, K)).astype("float16")
+b_np = (np.random.rand(K, N)).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
+cuda_c = tvm.nd.array(
+    np.zeros((M, N)).astype("float16"), ctx)
+
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    c_np = cuda_c.numpy()
+    np.testing.assert_allclose(
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e0, atol=1e0
+    )
 
 num_flops = 2 * M * K * N
 num_runs = 1

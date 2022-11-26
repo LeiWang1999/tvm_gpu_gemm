@@ -78,7 +78,7 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [N, K], dtype="int8")
+        B = T.match_buffer(b, [K, N], dtype="int8")
         C = T.match_buffer(c, [M, N], dtype="int32")
 
         for i, j, k in T.grid(M, N, K):
@@ -87,7 +87,7 @@ class MyModule:
                 with T.init():
                     C[vi, vj] = T.int32(0)
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("int32") * B[vj, vk].astype("int32")
+                    A[vi, vk].astype("int32") * B[vk, vj].astype("int32")
 
 
 ir_module = MyModule
@@ -233,17 +233,17 @@ def index_map_C(i, j):
 
 
 sch.transform_layout(A_warp, ("write", 0), index_map_A)
-sch.transform_layout(B_warp, ("write", 0), index_map_A)
+sch.transform_layout(B_warp, ("write", 0), index_map_B)
 sch.transform_layout(C_warp, ("read", 0), index_map_C)
 
 write_sch(sch, log_path, "transform_layout")
 
 sch.tensorize(loop_a, LDMATRIX_16x32_A_INTRIN)
-sch.tensorize(loop_b, LDMATRIX_16x32_B_TRANS_INTRIN)
+sch.tensorize(loop_b, LDMATRIX_32x16_B_INTRIN)
 write_sch(sch, log_path, "tensorize_ldmatrix")
 
 # _test_block = sch.get_block("")
-sch.tensorize(block_b_inner_i_tc, MMA_i8i8i32_TRANS_INTRIN)
+sch.tensorize(block_b_inner_i_tc, MMA_i8i8i32_INTRIN)
 
 sch.tensorize(sch.get_loops(block_init_c)[-2], MMA_fill_16x16_i32_INTRIN)
 sch.tensorize(sch.get_loops(C_warp)[-2], MMA_store_16x16_i32_global_INTRIN)
@@ -255,26 +255,20 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 a_np = (np.random.uniform(
-    size=(M, K)) * 256 - 128).astype("int8")
+    size=(M, K)) * 128).astype("int8")
 b_np = (np.random.uniform(
-    size=(K, N)) * 256 - 128).astype("int8")
+    size=(K, N)) * 128).astype("int8")
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M, N)).astype("int32"), ctx)
 
-print(a_np)
-print('=====================')
-print(b_np)
 
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
-    print(c_np)
-    print('=====================')
-    print(np.matmul(a_np.astype("int8"), b_np.astype("int8")))
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("int8"), b_np.astype("int8")), rtol=1e-1, atol=1e-1
+        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32")), rtol=1e-1, atol=1e-1
     )
 
 num_flops = 2 * M * K * N

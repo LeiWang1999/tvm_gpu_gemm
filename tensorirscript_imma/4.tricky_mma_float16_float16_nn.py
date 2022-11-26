@@ -5,12 +5,15 @@ import tvm.testing
 from tvm.script import tir as T
 import os
 from tvm.tir.tensor_intrin.cuda import (
-    MMA_fill_16x16_f16_INTRIN,
     LDMATRIX_16x16_A_INTRIN,
     LDMATRIX_16x16_B_INTRIN,
     MMA_f16f16f16_INTRIN,
-    MMA_store_16x16_f16_global_INTRIN
+    MMA_fill_16x16_f16_INTRIN,
+    MMA_store_16x16_f16_global_INTRIN,
+    shared_16x16_to_ldmatrix_32x8_layout,
 )
+# import tvm convert
+from tvm.runtime import convert
 
 log_path = "progress/tensorscript_imma/4.tricky_mma_float16_float16_nn"
 count = 0
@@ -34,6 +37,110 @@ def write_sch(sch, path, fname):
     write_code(sch.mod["main"].script(), path, py_fname)
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
+
+
+def get_ldmatrix_intrin(dtype, is_b, transposed, shared_scope="shared"):
+    m_dim = 16
+    k_dim = 16
+    warp_size = 32
+    half_warp = warp_size // 2
+    half_warp_expr = convert(half_warp)
+    local_size = (m_dim * k_dim) // warp_size
+    shared_offset = None
+    index_map = None
+
+    if transposed:
+        assert False, "Transposed matrix not supported"
+
+    ldmatrix_col_major = is_b and not transposed
+
+    if k_dim == 16:
+        assert dtype == "float16"
+
+        index_map = shared_16x16_to_ldmatrix_32x8_layout
+
+        def shared_offset(tx, stride): return stride * (tx % half_warp_expr) + 8 * (
+            tx // half_warp_expr
+        )
+    else:
+        assert False, "Only k_dim == 16 (float16) or k_dim == 32 (int8) supported for now"
+
+    assert index_map and shared_offset
+
+    if is_b and not transposed:
+        row_dim = k_dim
+        col_dim = m_dim
+    else:
+        row_dim = m_dim
+        col_dim = k_dim
+
+    shmem_shape = (row_dim, col_dim)
+
+    @T.prim_func
+    def ldmatrix_desc(warp_handle: T.handle, shared_handle: T.handle) -> None:
+        shared = T.match_buffer(
+            shared_handle,
+            shmem_shape,
+            dtype,
+            align=64,
+            offset_factor=16,
+            scope=shared_scope,
+        )
+        warp = T.match_buffer(
+            warp_handle, (warp_size, local_size), dtype, align=64, offset_factor=16, scope="warp"
+        )
+
+        with T.block("root"):
+            T.reads(shared[0:row_dim, 0:col_dim])
+            T.writes(warp[0:warp_size, 0:local_size])
+
+            for ax0, ax1 in T.grid(row_dim, col_dim):
+                with T.block("shared_warp"):
+                    v0, v1 = T.axis.remap("SS", [ax0, ax1])
+                    T.reads(shared[v0, v1])
+
+                    thread_id, local_id = T.meta_var(index_map(v0, v1))
+                    T.writes(warp[thread_id, local_id])
+                    warp[thread_id, local_id] = shared[v0, v1]
+
+    @T.prim_func
+    def ldmatrix_impl(warp_handle: T.handle, shared_handle: T.handle) -> None:
+        s0 = T.var("int32")
+        s1 = T.var("int32")
+        shared = T.match_buffer(
+            shared_handle,
+            shmem_shape,
+            dtype,
+            align=64,
+            offset_factor=16,
+            scope=shared_scope,
+            strides=[s0, s1],
+        )
+        warp = T.match_buffer(
+            warp_handle, (warp_size, local_size), dtype, align=64, offset_factor=16, scope="warp"
+        )
+
+        with T.block("root"):
+            T.reads(shared[0:row_dim, 0:col_dim])
+            T.writes(warp[0:warp_size, 0:local_size])
+            tx = T.env_thread("threadIdx.x")
+            T.launch_thread(tx, warp_size)
+
+            T.evaluate(
+                T.ptx_ldmatrix(
+                    ldmatrix_col_major,
+                    4,  # Always load 4 matrices
+                    ".b16",
+                    warp.data,
+                    warp.elem_offset + convert(local_size) * tx,
+                    shared.access_ptr("r"),
+                    shared_offset(tx, s0),
+                    dtype=dtype,
+                )
+            )
+
+    return ldmatrix_desc, ldmatrix_impl
+
 
 M = 16384
 N = 16384
@@ -132,33 +239,53 @@ write_sch(sch, log_path, "schedule_B_shared")
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
 write_sch(sch, log_path, "decompose_reduction")
+
+# transpose layout
+
+
+def _shared_16x16_to_ldmatrix_32x8_layout(i, j):
+    return (i * 2 + j // 8, j % 8)
+
+def index_map_B(i, j, wmma_i, wmma_j):
+    return (
+            i,
+            j,
+        *_shared_16x16_to_ldmatrix_32x8_layout(wmma_i, wmma_j),
+        )
+
+
+
+sch.transform_layout(block_shared_local_A, ("write", 0), index_map_B)
+sch.transform_layout(block_shared_local_B, ("write", 0), index_map_B)
+sch.transform_layout(block_local_C, ("read", 0), index_map_B)
+write_sch(sch, log_path, "transform_layout")
+
 init_block_b_i, init_block_b_j = sch.get_loops(init_block_b)[-4:-2]
-sch.tensorize(sch.get_loops(init_block_b)[-2], MMA_fill_16x16_f16_INTRIN)
+# sch.tensorize(sch.get_loops(init_block_b)[-2], MMA_fill_16x16_f16_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
-# block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(block_shared_local_A)[-4:-2]
-# sch.tensorize(sch.get_loops(block_shared_local_A)[-2], WMMA_LOAD_16x16x16_F16_A_INTRIN)
-# write_sch(sch, log_path,
-#           "tensorize_load")
-# block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(block_shared_local_B)[-4:-2]
-# sch.tensorize(sch.get_loops(block_shared_local_B)[-2], WMMA_LOAD_16x16x16_F16_B_INTRIN)
-# sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_f16f16f16_INTRIN)
-# sch.tensorize(sch.get_loops(block_local_C)
-#               [-2], WMMA_STORE_16x16x16_F16_GLOBAL_INTRIN)
-# write_sch(sch, log_path,
-#            "tensorize")
+block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(block_shared_local_A)[-4:-2]
+sch.tensorize(sch.get_loops(block_shared_local_A)[-2], LDMATRIX_16x16_A_INTRIN)
+write_sch(sch, log_path,
+          "tensorize_load")
+block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(block_shared_local_B)[-4:-2]
+sch.tensorize(sch.get_loops(block_shared_local_B)[-2], LDMATRIX_16x16_B_INTRIN)
+sch.tensorize(kernel_i, MMA_f16f16f16_INTRIN)
+# sch.tensorize(sch.get_loops(block_local_C)[-2], MMA_store_16x16_f16_global_INTRIN)
+write_sch(sch, log_path,
+           "tensorize")
 
 # unroll
-sch.unroll(init_block_b_i)
-sch.unroll(init_block_b_j)
-sch.unroll(block_shared_local_A_i)
-sch.unroll(block_shared_local_A_j)
-sch.unroll(block_shared_local_B_i)
-sch.unroll(block_shared_local_B_j)
-sch.unroll(ii)
-sch.unroll(jj)
-sch.unroll(A_shared_inner)
-sch.unroll(B_shared_inner)
+# sch.unroll(init_block_b_i)
+# sch.unroll(init_block_b_j)
+# sch.unroll(block_shared_local_A_i)
+# sch.unroll(block_shared_local_A_j)
+# sch.unroll(block_shared_local_B_i)
+# sch.unroll(block_shared_local_B_j)
+# sch.unroll(ii)
+# sch.unroll(jj)
+# sch.unroll(A_shared_inner)
+# sch.unroll(B_shared_inner)
 
 
 write_sch(sch, log_path,
@@ -171,7 +298,7 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 cuda_a = tvm.nd.array(np.arange(M * K).reshape((M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16"), ctx)
+cuda_b = tvm.nd.array(np.arange(N * K).reshape((K // wmma_k, N // wmma_n, wmma_k, wmma_n)).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
