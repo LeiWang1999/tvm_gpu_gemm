@@ -14,8 +14,10 @@ from tvm.tir.tensor_intrin.cuda import (
 )
 # import tvm convert
 from tvm.runtime import convert
+from tvm.tir.expr import Cast, IntImm
+from tvm.tir.function import TensorIntrin
 
-log_path = "progress/tensorscript_imma/4.tricky_mma_float16_float16_nn"
+log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nn"
 count = 0
 
 
@@ -39,6 +41,51 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
+def get_mma_fill_intrin(dtype, local_size):
+    m_dim = 16
+    k_dim = 16
+    n_dim = 16
+    warp_size = 32
+    zero = IntImm("int32", 0).astype(dtype)
+    def _shared_16x16_to_ldmatrix_32x8_layout(i, j):
+        return (i * 2 + j // 8, j % 8)
+    # Assume M = N = 16
+    index_map = _shared_16x16_to_ldmatrix_32x8_layout
+
+    @T.prim_func
+    def mma_fill_desc(a: T.handle) -> None:
+        C_warp = T.match_buffer(
+            a, [warp_size, local_size], dtype=dtype, scope="warp")
+
+        with T.block("root"):
+            T.reads()
+            T.writes(C_warp[0:warp_size, 0:local_size])
+            for i0, i1 in T.grid(m_dim, n_dim):
+                with T.block("C_warp"):
+                    i, j = T.axis.remap("SS", [i0, i1])
+                    thread_id, local_id = T.meta_var(index_map(i, j))
+                    T.reads()
+                    T.writes(C_warp[thread_id, local_id])
+                    C_warp[thread_id, local_id] = zero
+
+    @T.prim_func
+    def mma_fill_impl(a: T.handle) -> None:
+        C_warp = T.match_buffer(
+            a, [warp_size, local_size], dtype=dtype, scope="warp", offset_factor=1
+        )
+
+        with T.block("root"):
+            T.reads()
+            T.writes(C_warp[0:warp_size, 0:local_size])
+            tx = T.env_thread("threadIdx.x")
+            T.launch_thread(tx, warp_size)
+
+            T.evaluate(T.mma_fill(local_size, C_warp.data,
+                       C_warp.elem_offset, dtype=dtype))
+
+    return mma_fill_desc, mma_fill_impl
+
+
 def get_ldmatrix_intrin(dtype, is_b, transposed, shared_scope="shared"):
     m_dim = 16
     k_dim = 16
@@ -54,14 +101,20 @@ def get_ldmatrix_intrin(dtype, is_b, transposed, shared_scope="shared"):
 
     ldmatrix_col_major = is_b and not transposed
 
+
+    def _shared_16x16_to_ldmatrix_32x8_layout(i, j):
+        return (i * 2 + j // 8, j % 8)
+        
     if k_dim == 16:
         assert dtype == "float16"
 
-        index_map = shared_16x16_to_ldmatrix_32x8_layout
+        index_map = _shared_16x16_to_ldmatrix_32x8_layout
 
-        def shared_offset(tx, stride): return stride * (tx % half_warp_expr) + 8 * (
-            tx // half_warp_expr
-        )
+        def shared_offset(tx, stride): 
+            # stride is a constant, which means the leading dimension size.
+            
+            return tx * stride // 2
+        
     else:
         assert False, "Only k_dim == 16 (float16) or k_dim == 32 (int8) supported for now"
 
@@ -142,9 +195,180 @@ def get_ldmatrix_intrin(dtype, is_b, transposed, shared_scope="shared"):
     return ldmatrix_desc, ldmatrix_impl
 
 
+def get_mma_intrin(k_dim, out_dtype, b_transposed):
+    m_dim = 16
+    k_dim = 16
+    n_dim = 16
+    warp_size = 32
+    local_size = (m_dim * k_dim) // warp_size
+    local_size_out = (m_dim * n_dim) // 32
+
+    def _shared_16x16_to_ldmatrix_32x8_layout(i, j):
+        return (i * 2 + j // 8, j % 8)
+
+    index_map_C = _shared_16x16_to_ldmatrix_32x8_layout
+
+    if k_dim == 16:
+        index_map_A = _shared_16x16_to_ldmatrix_32x8_layout
+        index_map_B = _shared_16x16_to_ldmatrix_32x8_layout
+        mma_prefix = "m16n8k16"
+    else:
+        assert False
+
+    out_dtype_abbrv = {"float16": "fp16",
+                       "float32": "fp32", "int32": "int32"}[out_dtype]
+
+    if out_dtype in ["float16", "float32"]:
+        in_dtype = "float16"
+        in_dtype_abbrv = "fp16"
+    else:
+        in_dtype = "int8"
+        in_dtype_abbrv = "int8"
+
+    def maybe_cast(v):
+        if out_dtype in ["float32", "int32"]:
+            return Cast(out_dtype, v)
+        return v
+
+    def maybe_swap(i, j):
+        if b_transposed:
+            return j, i
+        return i, j
+
+    @T.prim_func
+    def mma_sync_desc(a: T.handle, b: T.handle, c: T.handle) -> None:
+        A = T.match_buffer(
+            a, (warp_size, local_size), in_dtype, align=64, offset_factor=16, scope="warp"
+        )
+        B = T.match_buffer(
+            b, (warp_size, local_size), in_dtype, align=64, offset_factor=16, scope="warp"
+        )
+        C = T.match_buffer(
+            c, (warp_size, local_size_out), out_dtype, align=64, offset_factor=16, scope="warp"
+        )
+
+        with T.block("root"):
+            T.reads(
+                C[0:warp_size, 0:local_size_out],
+                A[0:warp_size, 0:local_size],
+                B[0:warp_size, 0:local_size],
+            )
+            T.writes(C[0:warp_size, 0:local_size_out])
+
+            for i, j, k in T.grid(m_dim, n_dim, k_dim):
+                with T.block("C"):
+                    i, j, k = T.axis.remap("SSR", [i, j, k])
+                    b_row_ind, b_col_ind = maybe_swap(k, j)
+
+                    thread_id_C, local_id_C = T.meta_var(index_map_C(i, j))
+                    thread_id_A, local_id_A = T.meta_var(index_map_A(i, k))
+                    thread_id_B, local_id_B = T.meta_var(
+                        index_map_B(b_row_ind, b_col_ind))
+
+                    T.reads(
+                        C[thread_id_C, local_id_C],
+                        A[thread_id_A, local_id_A],
+                        B[thread_id_B, local_id_B],
+                    )
+                    T.writes(C[thread_id_C, local_id_C])
+
+                    C[thread_id_C, local_id_C] += maybe_cast(
+                        A[thread_id_A, local_id_A]
+                    ) * maybe_cast(B[thread_id_B, local_id_B])
+
+    @T.prim_func
+    def mma_sync_impl(a: T.handle, b: T.handle, c: T.handle) -> None:
+        A = T.match_buffer(
+            a, (warp_size, local_size), in_dtype, align=64, offset_factor=16, scope="warp"
+        )
+        B = T.match_buffer(
+            b, (warp_size, local_size), in_dtype, align=64, offset_factor=16, scope="warp"
+        )
+        C = T.match_buffer(
+            c, (warp_size, local_size_out), out_dtype, align=64, offset_factor=16, scope="warp"
+        )
+
+        with T.block("root"):
+            T.reads(
+                C[0:warp_size, 0:local_size_out],
+                A[0:warp_size, 0:local_size],
+                B[0:warp_size, 0:local_size],
+            )
+            T.writes(C[0:warp_size, 0:local_size_out])
+            tx = T.env_thread("threadIdx.x")
+            T.launch_thread(tx, warp_size)
+
+            T.evaluate(
+                T.ptx_mma(
+                    mma_prefix,
+                    "row",
+                    "col",
+                    in_dtype_abbrv,
+                    in_dtype_abbrv,
+                    out_dtype_abbrv,
+                    A.data,
+                    A.elem_offset + tx * convert(local_size),
+                    B.data,
+                    B.elem_offset + tx * convert(local_size),
+                    C.data,
+                    C.elem_offset + tx * convert(local_size_out),
+                    False,
+                    dtype=out_dtype,
+                )
+            )
+
+            T.evaluate(
+                T.ptx_mma(
+                    mma_prefix,
+                    "row",
+                    "col",
+                    in_dtype_abbrv,
+                    in_dtype_abbrv,
+                    out_dtype_abbrv,
+                    A.data,
+                    A.elem_offset + tx * convert(local_size),
+                    B.data,
+                    B.elem_offset + tx *
+                    convert(local_size) + convert(local_size) // 2,
+                    C.data,
+                    C.elem_offset + tx *
+                    convert(local_size_out) + convert(local_size_out) // 2,
+                    False,
+                    dtype=out_dtype,
+                )
+            )
+
+    return mma_sync_desc, mma_sync_impl
+
+
+_MMA_fill_16x16_f16_INTRIN = "_mma_fill_16x16_f16"
+TensorIntrin.register(_MMA_fill_16x16_f16_INTRIN, *
+                      get_mma_fill_intrin("float16", 8))
+
+_MMA_f16f16f16_INTRIN = "_mma_f16f16f16"
+TensorIntrin.register(_MMA_f16f16f16_INTRIN, *
+                      get_mma_intrin(16, "float16", False))
+
+_LDMATRIX_16x16_A_INTRIN = "_mma.ldmatrix_16x16_a"
+TensorIntrin.register(_LDMATRIX_16x16_A_INTRIN, *
+                      get_ldmatrix_intrin("float16", False, False))
+
+_LDMATRIX_16x16_B_INTRIN = "_mma.ldmatrix_16x16_b"
+TensorIntrin.register(_LDMATRIX_16x16_B_INTRIN, *
+                      get_ldmatrix_intrin("float16", True, False))
+
+
+
+VERIFY = True
+
 M = 16384
 N = 16384
 K = 16384
+if VERIFY:
+    M = 256
+    N = 256
+    K = 256
+
 warp_size = 32
 block_row_warps = 4
 block_col_warps = 2
@@ -261,16 +485,19 @@ sch.transform_layout(block_local_C, ("read", 0), index_map_B)
 write_sch(sch, log_path, "transform_layout")
 
 init_block_b_i, init_block_b_j = sch.get_loops(init_block_b)[-4:-2]
-# sch.tensorize(sch.get_loops(init_block_b)[-2], MMA_fill_16x16_f16_INTRIN)
+sch.tensorize(sch.get_loops(init_block_b)[-2], _MMA_fill_16x16_f16_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
 block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(block_shared_local_A)[-4:-2]
-sch.tensorize(sch.get_loops(block_shared_local_A)[-2], LDMATRIX_16x16_A_INTRIN)
+sch.tensorize(sch.get_loops(block_shared_local_A)
+              [-2], _LDMATRIX_16x16_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
 block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(block_shared_local_B)[-4:-2]
-sch.tensorize(sch.get_loops(block_shared_local_B)[-2], LDMATRIX_16x16_B_INTRIN)
-sch.tensorize(kernel_i, MMA_f16f16f16_INTRIN)
+sch.tensorize(sch.get_loops(block_shared_local_B)
+              [-2], _LDMATRIX_16x16_B_INTRIN)
+sch.tensorize(kernel_i, _MMA_f16f16f16_INTRIN)
+
 # sch.tensorize(sch.get_loops(block_local_C)[-2], MMA_store_16x16_f16_global_INTRIN)
 write_sch(sch, log_path,
            "tensorize")
@@ -297,11 +524,23 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((K // wmma_k, N // wmma_n, wmma_k, wmma_n)).astype("float16"), ctx)
+a_np = np.random.rand(
+    M // wmma_m, K // wmma_k, wmma_m, wmma_k).astype("float16")
+b_np = np.random.rand(
+    K // wmma_k, N // wmma_n, wmma_k, wmma_n).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
-cuda_mod(cuda_a, cuda_b, cuda_c)
+
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
+    b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
+    c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    np.testing.assert_allclose(
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e-1, atol=1e-1
+    )
 
 num_flops = 2 * M * K * N
 num_runs = 1

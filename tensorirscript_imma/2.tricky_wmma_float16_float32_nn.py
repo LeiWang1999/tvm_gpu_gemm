@@ -12,7 +12,7 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_F32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorscript_imma/2.tricky_wmma_float16_nn"
+log_path = "progress/tensorscript_imma/2.tricky_wmma_float16_float32_nn"
 count = 0
 def write_code(code, path, fname):
     global count
@@ -175,6 +175,7 @@ if VERIFY:
     a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
     b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
     c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    
     np.testing.assert_allclose(
         c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e-1, atol=1e-1
     )

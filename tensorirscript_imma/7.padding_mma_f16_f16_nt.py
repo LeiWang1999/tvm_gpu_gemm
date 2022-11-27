@@ -34,7 +34,7 @@ from tvm.tir.tensor_intrin.cuda import (
 )
 
 
-log_path = "progress/tensorirscript_imma/6.padding_mma_f16_nn"
+log_path = "progress/tensorirscript_imma/7.padding_mma_f16_f16_nt"
 count = 0
 def write_code(code, path, fname):
     global count
@@ -55,7 +55,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -78,7 +78,7 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M, K], dtype="float16")
-        B = T.match_buffer(b, [K, N], dtype="float16")
+        B = T.match_buffer(b, [N, K], dtype="float16")
         C = T.match_buffer(c, [M, N], dtype="float16")
 
         for i, j, k in T.grid(M, N, K):
@@ -87,7 +87,7 @@ class MyModule:
                 with T.init():
                     C[vi, vj] = T.float16(0)
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("float16") * B[vk, vj].astype("float16")
+                    A[vi, vk].astype("float16") * B[vj, vk].astype("float16")
 
 
 ir_module = MyModule
@@ -142,10 +142,11 @@ def fetch_to_shared(block, idx):
     sch.compute_at(block_read, bk)
     vector_size = 8
     fused = sch.fuse(*sch.get_loops(block_read)[-2:])
-    _, f_1, f_2, f_3 = sch.split(
-        fused, factors=[None, block_col_warps, warp_size, vector_size])
+    _, f_0, f_1, f_2, f_3 = sch.split(
+        fused, factors=[None, block_row_warps, block_col_warps, warp_size, vector_size])
     sch.bind(f_2, "threadIdx.x")
     sch.bind(f_1, "threadIdx.y")
+    sch.bind(f_0, "threadIdx.z")
     sch.vectorize(f_3)
     offset = 8
     sch.storage_align(block_read, 0, axis=-2, factor=32, offset=offset)
@@ -239,10 +240,10 @@ sch.transform_layout(C_warp, ("read", 0), index_map_C)
 write_sch(sch, log_path, "transform_layout")
 
 sch.tensorize(loop_a, LDMATRIX_16x16_A_INTRIN)
-sch.tensorize(loop_b, LDMATRIX_16x16_B_INTRIN)
+sch.tensorize(loop_b, LDMATRIX_16x16_B_TRANS_INTRIN)
 write_sch(sch, log_path, "tensorize_ldmatrix")
 
-sch.tensorize(block_b_inner_i_tc, MMA_f16f16f16_INTRIN)
+sch.tensorize(block_b_inner_i_tc, MMA_f16f16f16_TRANS_INTRIN)
 write_sch(sch, log_path, "tensorize_mma_sync")
 
 sch.tensorize(sch.get_loops(block_init_c)[-2], MMA_fill_16x16_f16_INTRIN)
