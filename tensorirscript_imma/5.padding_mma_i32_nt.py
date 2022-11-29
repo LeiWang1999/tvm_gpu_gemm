@@ -267,7 +267,7 @@ if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32")), rtol=1e-1, atol=1e-1
+        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32").T), rtol=1e-1, atol=1e-1
     )
 
 num_flops = 2 * M * K * N

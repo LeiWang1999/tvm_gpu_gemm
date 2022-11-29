@@ -12,7 +12,7 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorscript_imma/0.tricky_wmma"
+log_path = "progress/tensorirscript_imma/0.tricky_wmma_int8_int32"
 count = 0
 
 
@@ -45,8 +45,8 @@ warp_size = 32
 block_row_warps = 2
 block_col_warps = 2
 warp_row_tiles = 2
-warp_col_tiles = 8
-chunk = 4
+warp_col_tiles = 2
+chunk = 2
 vec = 16
 wmma_m = 16
 wmma_n = 16

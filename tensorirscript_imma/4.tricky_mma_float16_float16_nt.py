@@ -17,7 +17,7 @@ from tvm.runtime import convert
 from tvm.tir.expr import Cast, IntImm
 from tvm.tir.function import TensorIntrin
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nn"
+log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nt"
 count = 0
 
 

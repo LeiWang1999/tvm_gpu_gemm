@@ -55,7 +55,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = False
+VERIFY = True
 
 M = 16384
 N = 16384
@@ -257,8 +257,7 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.random.rand(
-    M, K)).astype("float16")
+a_np = (np.random.rand(M, K)).astype("float16")
 b_np = (np.random.rand(K, N)).astype("float16")
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
@@ -269,7 +268,7 @@ if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e0, atol=1e0
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-3, atol=1e-1
     )
 
 num_flops = 2 * M * K * N
