@@ -38,6 +38,59 @@ def cuda_golden_permutation_v2(i, j):
     return (i // 8, j // 64, *shared_8x64_to_free_4x128_layout(i % 8, j % 64))
 
 
-for m in range(120, 128):
-    for n in range(0, 64, 16):
-        print(m, n, cuda_golden_permutation(m, n))
+def shared_16x16_to_ldmatrix_32x8_layout(i, j):
+    thread_id = 4 * (i % 8) + (j % 8) // 2
+    return thread_id, 4 * (j // 8) + (i // 8) * 2 + (j % 2)
+
+
+def shared_offset(tx, stride): return stride * (tx % 16) + 8 * (
+    tx // 16
+)
+
+# convert 4d array to 2d array
+def convert4d_to_2d(i, j, k, l):
+    return (i * 4 + j, k * 16 + l)
+
+
+def global_16x32_to_shared_load_16x32(i, j):
+    # 0, 0-16 -> 0, 0-16
+    # 1, 0-16 -> 1, 0-16
+    # 2, 0-16 -> 2, 0-16
+    # 3, 0-16 -> 3, 0-16
+    """
+        re-orgnize the global memory to shared memory access pattern
+        key context : 
+            j % 16 -> index
+            j // 16 
+            i % 16 -> index
+    """
+    thread_id = (i * 32 + j) // 16
+    row = thread_id % 16
+    col = (j % 16) + (thread_id // 16) * 16
+    return row, col
+
+
+def shared_16x32_to_ldmatrix_32x16_permutation(i, j):
+    return (j // 16) * 16 + (i // 8) * 8 + i % 8, j % 16
+
+# for m in range(0, 16):
+#     for n in range(0, 16, 1):
+#         print(m, n, shared_16x16_to_ldmatrix_32x8_layout(m, n))
+
+def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
+    return (j // 8) * 16 + (i // 8) * 8 + i % 8, j % 8
+
+
+# def shared_16x32_to_ldmatrix_32x16_layout(i, j):
+#     # convert (i // 8, j // 16, i % 8, j % 16) to a 2d array
+#     return (i * 2 + j // 16, j % 16)
+
+
+def shared_16x16_to_ldmatrix_32x8_layout(i, j):
+    thread_id = 4 * (i % 8) + (j % 8) // 2
+    return thread_id, 4 * (j // 8) + (i // 8) * 2 + (j % 2)
+
+for m in range(0, 16):
+    for n in range(0, 32, 1):
+        print(m * 2 + n // 16, n %
+              16, global_16x32_to_shared_load_16x32(m, n))
