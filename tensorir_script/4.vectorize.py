@@ -11,7 +11,19 @@ from tvm.script import tir as T
 _dtype = "float32"
 
 
-def write_code(code, fname):
+log_path = "progress/tensorir_script/4.vectorize"
+count = 0
+
+
+def write_code(code, path, fname):
+    global count
+    # if path not exist, create it
+    fname = str(count) + "." + fname
+    count += 1
+    if not os.path.exists(path):
+        os.makedirs(path)
+    # join path and fname
+    fname = os.path.join(path, fname)
     with open(fname, "w") as f:
         f.write(code)
 
@@ -64,13 +76,13 @@ block_shared_B = sch.cache_read(block_b, 1, "shared")
 block_local_B = sch.cache_read(block_b, 1, "local")
 block_cl = sch.cache_write(block_b, 0, "local")
 
-write_code(sch.mod["main"].script(), "0.origin.cu")
+write_code(sch.mod["main"].script(), log_path, "0.origin.py")
 
 (i, j, k) = sch.get_loops(block_b)
 bx, xi = sch.split(i, factors=[Grid_Size_X, None])
 by, yi = sch.split(j, factors=[Grid_Size_Y, None])
 sch.reorder(bx, by, xi, yi)
-write_code(sch.mod["main"].script(), "1.reorder.cu")
+write_code(sch.mod["main"].script(), log_path, "1.reorder.py")
 sch.bind(by, "blockIdx.y")
 sch.bind(bx, "blockIdx.x")
 
@@ -83,14 +95,14 @@ sch.bind(ty, "threadIdx.y")
 sch.bind(tx, "threadIdx.x")
 sch.bind(tyz, "vthread.y")
 sch.bind(txz, "vthread.x")
-write_code(sch.mod["main"].script(), "2.thread_bind.cu")
+write_code(sch.mod["main"].script(), log_path, "2.thread_bind.py")
 
 
 sch.reverse_compute_at(block_cl, tx, preserve_unit_loops=True)
-write_code(sch.mod["main"].script(), "3.cache_write_compute_at.cu")
+write_code(sch.mod["main"].script(), log_path, "3.cache_write_compute_at.py")
 
 ko, ki = sch.split(k, [None, BK])
-write_code(sch.mod["main"].script(), "4.split.cu")
+write_code(sch.mod["main"].script(), log_path, "4.split.py")
 
 sch.reorder(ko, ki, yi, xi)
 
@@ -110,7 +122,7 @@ can not run because:
 '''
 
 
-write_code(sch.mod["main"].script(), "4.cache_read_compute_at.cu")
+write_code(sch.mod["main"].script(), log_path, "4.cache_read_compute_at.py")
 
 aa_yi, aa_xi = sch.get_loops(block_shared_A)[-2:]  # loops size is 7
 aa_yi, aa_ty = sch.split(aa_yi, factors=[None, Block_Size_Y])
@@ -140,7 +152,7 @@ sch.vectorize(sch.get_loops(block_local_B)[-1])
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
 
-write_code(cuda_mod.imported_modules[0].get_source(), "tmp.cu")
+write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.py")
 
 cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype(_dtype), ctx)
 cuda_b = tvm.nd.array(np.arange(K * N).reshape((K, N)).astype(_dtype), ctx)

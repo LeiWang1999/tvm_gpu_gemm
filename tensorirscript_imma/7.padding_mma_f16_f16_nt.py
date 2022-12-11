@@ -55,7 +55,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -65,8 +65,8 @@ if VERIFY:
     N = 256
     K = 256
 
-BM = 256
-BN = 128
+BM = 128
+BN = 256
 BK = 32
 warp_size = 32
 block_row_warps = 2
@@ -268,7 +268,7 @@ if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-3, atol=1e-1
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-1, atol=1e-1
     )
 
 num_flops = 2 * M * K * N

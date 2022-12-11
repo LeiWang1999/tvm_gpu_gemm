@@ -38,14 +38,11 @@ def write_sch(sch, path, fname):
 M = 16384
 N = 16384
 K = 16384
-BM = 128
-BN = 128
-BK = 32
 warp_size = 32
 block_row_warps = 2
 block_col_warps = 2
 warp_row_tiles = 2
-warp_col_tiles = 2
+warp_col_tiles = 8
 chunk = 2
 vec = 16
 wmma_m = 16
