@@ -43,7 +43,7 @@ def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
     return (i // 8) * 16 + (j // 8) * 8 + i % 8, j % 8
 
 
-def global_16x32_to_shared_load_16x32_layout(i, j):
+def A_global_16x32_to_shared_load_16x32_layout(i, j):
     # 0, 0-16 -> 0, 0-16
     # 1, 0-16 -> 1, 0-16
     # 2, 0-16 -> 2, 0-16
@@ -60,6 +60,37 @@ def global_16x32_to_shared_load_16x32_layout(i, j):
     col = (j % 16) + (thread_id // 16) * 16
     return row, col
 
+
+def B_global_16x32_to_shared_load_16x32_layout(i, j):
+    # 0, 0-16 -> 0, 0-16
+    # 1, 0-16 -> 1, 0-16
+    # 2, 0-16 -> 2, 0-16
+    # 3, 0-16 -> 3, 0-16
+    # 8, 0-16 -> 0, 16-31
+    """
+        re-orgnize the global memory to shared memory access pattern
+        key context : 
+            j % 16 -> index
+            j // 16 
+            i % 16 -> index
+    """
+    thread_id = i * 2 + j // 16
+    row = (i // 8) * 8 + (thread_id % 8)
+    col = (j % 16) + 16 * ((thread_id // 8) % 2)
+    # col = 16 * (thread_id // 8) + 16 * ((thread_id // 8) % 2)
+    # if j > 16 and i > 8 or j > 16 and i < 8:
+    # if thread_id >= 8 and thread_id <= 15 or thread_id >= 24 and thread_id <= 31:
+    # thread_id // 8
+    # _t = thread_id // 8
+    # if _t == 1 or _t == 3:
+    #     col = (j % 16) + 16
+
+    # if thread_id >= 8 and thread_id <= 15:
+    #     col = (j % 16) + 16
+    # elif thread_id >= 24 and thread_id <= 31:
+    #     col = (j % 16) + 16
+
+    return row, col
 
 def shared_16x32_to_ldmatrix_32x16_permutation(i, j):
     return (j // 16) * 16 + (i // 8) * 8 + i % 8, j % 16

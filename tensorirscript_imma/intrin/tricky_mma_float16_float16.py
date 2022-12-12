@@ -47,7 +47,7 @@ def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
     return (i // 8) * 16 + (j // 8) * 8 + i % 8, j % 8
 
 
-def global_16x16_to_shared_load_16x16_layout(i, j):
+def A_global_16x16_to_shared_load_16x16_layout(i, j):
     # 0, 0-7 -> 0, 0-7
     # 1, 0-7 -> 1, 0-7
     # 2, 0-7 -> 2, 0-7
@@ -56,6 +56,17 @@ def global_16x16_to_shared_load_16x16_layout(i, j):
     thread_id = i * 2 + j // 8
     row = thread_id % 16
     col = (j % 8) + (thread_id // 16) * 8
+    return row, col
+
+
+def B_global_16x16_to_shared_load_16x16_layout(i, j):
+    # 0, 0-7 -> 0, 0-7
+    # 1, 0-7 -> 1, 0-7
+    # 2, 0-7 -> 2, 0-7
+
+    thread_id = i * 2 + j // 8
+    row = (i // 8) * 8 + (thread_id % 8)
+    col = (j % 8) + 8 * ((thread_id // 8) % 2)
     return row, col
 
 

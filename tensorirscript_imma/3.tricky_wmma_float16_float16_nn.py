@@ -12,7 +12,7 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_F16_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorscript_imma/3.tricky_wmma_float16_float16_nn"
+log_path = "progress/tensorirscript_imma/3.tricky_wmma_float16_float16_nn"
 count = 0
 
 
@@ -48,7 +48,7 @@ if VERIFY:
     
 warp_size = 32
 block_row_warps = 4
-block_col_warps = 2
+block_col_warps = 4
 warp_row_tiles = 2
 warp_col_tiles = 4
 chunk = 2
@@ -100,8 +100,8 @@ sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k
 
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_i, "blockIdx.x")
-sch.bind(block_j, "blockIdx.y")
+sch.bind(block_i, "blockIdx.y")
+sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
 
@@ -157,16 +157,16 @@ write_sch(sch, log_path,
            "tensorize")
 
 # unroll
-sch.unroll(init_block_b_i)
-sch.unroll(init_block_b_j)
-sch.unroll(block_shared_local_A_i)
-sch.unroll(block_shared_local_A_j)
-sch.unroll(block_shared_local_B_i)
-sch.unroll(block_shared_local_B_j)
-sch.unroll(ii)
-sch.unroll(jj)
-sch.unroll(A_shared_inner)
-sch.unroll(B_shared_inner)
+# sch.unroll(init_block_b_i)
+# sch.unroll(init_block_b_j)
+# sch.unroll(block_shared_local_A_i)
+# sch.unroll(block_shared_local_A_j)
+# sch.unroll(block_shared_local_B_i)
+# sch.unroll(block_shared_local_B_j)
+# sch.unroll(ii)
+# sch.unroll(jj)
+# sch.unroll(A_shared_inner)
+# sch.unroll(B_shared_inner)
 
 
 write_sch(sch, log_path,

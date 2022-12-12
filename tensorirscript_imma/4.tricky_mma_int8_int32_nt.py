@@ -28,7 +28,8 @@ from intrin.tricky_mma_int8_int32 import (
     shared_32x16_to_ldmatrix_32x16_layout,
     shared_16x32_to_ldmatrix_32x16_layout,
     shared_16x32_to_ldmatrix_32x16_permutation,
-    global_16x32_to_shared_load_16x32_layout,
+    A_global_16x32_to_shared_load_16x32_layout,
+    B_global_16x32_to_shared_load_16x32_layout,
 )
 
 log_path = "progress/tensorirscript_imma/4.tricky_mma_int8_int32_nt"
@@ -55,7 +56,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = False
+VERIFY = True
 
 M = 16384
 N = 16384
@@ -140,13 +141,16 @@ write_sch(sch, log_path, "cache_read_compute_at")
 # 128x32
 # sch.transform_layout(block_b, ("write", 0), permutation)
 def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+    return (i, j, *A_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
 
+
+def B_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *B_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
 
 sch.transform_layout(block_shared_A, ("read", 0),
                      permutation)
 sch.transform_layout(block_shared_B, ("read", 0),
-                     permutation)
+                     B_permutation)
 
 write_sch(sch, log_path, "transform_layout")
 
@@ -238,10 +242,10 @@ write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 a_np = (np.random.rand
     (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
 
-b_np = (np.ones(
-    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
-# b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
+# b_np = (np.ones(
+#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+b_np = (np.random.rand(
+    N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
 cuda_c = tvm.nd.array(

@@ -42,12 +42,11 @@ from intrin.tricky_mma_float16_float16 import (
     TRICKY_MMA_f16f16f16_TRANS_INTRIN,
     TRICKY_MMA_store_16x16_f16_global_INTRIN,
     A_global_16x16_to_shared_load_16x16_layout,
-    B_global_16x16_to_shared_load_16x16_layout,
     C_shared_16x16_to_ldmatrix_32x8_layout,
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nt"
+log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nn"
 count = 0
 
 
@@ -98,9 +97,8 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M // wmma_m, K // wmma_k, wmma_m, wmma_k], dtype="float16")
-        B = T.match_buffer(b, [N // wmma_n, K // wmma_k, wmma_n, wmma_k], dtype="float16")
-        C = T.match_buffer(c, [M // wmma_m, N // wmma_n,
-                           wmma_m, wmma_n], dtype="float16")
+        B = T.match_buffer(b, [K // wmma_k, N // wmma_n, wmma_k, wmma_n], dtype="float16")
+        C = T.match_buffer(c, [M // wmma_m, N // wmma_n, wmma_m, wmma_n], dtype="float16")
 
         for ii, jj, kk, i, j, k  in T.grid(M // wmma_m, N // wmma_n, K // wmma_k, wmma_m, wmma_n, wmma_k):
             with T.block("B"):
@@ -108,7 +106,7 @@ class MyModule:
                 with T.init():
                     C[vii, vjj, vi, vj] = 0.0
                 C[vii, vjj, vi, vj] = C[vii, vjj, vi, vj] + \
-                    A[vii, vkk, vi, vk] * B[vjj, vkk, vj, vk]
+                    A[vii, vkk, vi, vk] * B[vkk, vjj, vk, vj]
 
 
 ir_module = MyModule
@@ -153,16 +151,14 @@ write_sch(sch, log_path, "cache_read_compute_at")
 
 
 # 128x32
-def A_permutation(i, j, kernel_i, kernel_j):
+def permutation(i, j, kernel_i, kernel_j):
     return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
-def B_permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 sch.transform_layout(block_shared_A, ("read", 0),
-                     A_permutation)
+                     permutation)
 sch.transform_layout(block_shared_B, ("read", 0),
-                     B_permutation)
+                     permutation)
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
@@ -216,8 +212,8 @@ write_sch(sch, log_path,
           "tensorize_load")
 block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(block_shared_local_B)[-4:-2]
 sch.tensorize(sch.get_loops(block_shared_local_B)
-              [-2], TRICKY_LDMATRIX_16x16_B_TRANS_INTRIN)
-sch.tensorize(kernel_i, TRICKY_MMA_f16f16f16_TRANS_INTRIN)
+              [-2], TRICKY_LDMATRIX_16x16_B_INTRIN)
+sch.tensorize(kernel_i, TRICKY_MMA_f16f16f16_INTRIN)
 
 sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_f16_global_INTRIN)
 write_sch(sch, log_path,
@@ -250,18 +246,18 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = (np.ones(
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("float16")
+a_np = (np.ones(
+    (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("float16")
 # a_np = np.arange(M * K).reshape(M // wmma_m, K //
 #                                 wmma_k, wmma_m, wmma_k).astype("float16")
-a_np = (np.random.rand
-        (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
+# a_np = (np.random.rand
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
 # b_np = (np.ones(
-#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("float16")
-# b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("float16")
+#     (K // wmma_k, N // wmma_n,  wmma_k, wmma_n))).astype("float16")
+# b_np = np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n).astype("float16")
 
-b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 32).astype("float16")
+b_np = np.mod(np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n), 32).astype("float16")
 # print(b_np)
 # b_np = (np.random.rand(
 #     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
@@ -277,7 +273,7 @@ if VERIFY:
     b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
     c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-2, atol=1e-2
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e-2, atol=1e-2
     )
 # cuda_mod(cuda_a, cuda_b, cuda_c)
 # print(cuda_c.numpy())
