@@ -11,7 +11,7 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/amos_with_tensorir/0.int8_int32_nt"
+log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nt"
 count = 0
 
 
@@ -34,6 +34,7 @@ def write_sch(sch, path, fname):
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
 
+
 M = 16384
 N = 16384
 K = 16384
@@ -50,6 +51,7 @@ vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
+split_k = 1
 
 @tvm.script.ir_module
 class MyModule:
@@ -112,23 +114,26 @@ sch.transform_layout(block_tricky_local_C, ("write", 0),tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform")
 
+
 (i, j, k) = sch.get_loops(block_b)
 i, kernel_i = sch.split(i, factors=[None, wmma_m])
 j, kernel_j = sch.split(j, factors=[None, wmma_n])
 k, kernel_k = sch.split(k, factors=[None, wmma_k])
 sch.reorder(i, j, k, kernel_i, kernel_j, kernel_k)
 
-write_sch(sch, log_path, "tricky_extract")
+write_sch(sch, log_path, "tricky_extract_compute")
 
 block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
+block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_i, "blockIdx.x")
-sch.bind(block_j, "blockIdx.y")
+sch.bind(block_k, "blockIdx.z")
+sch.bind(block_i, "blockIdx.y")
+sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
 
@@ -144,7 +149,7 @@ sch.reverse_compute_at(block_tricky_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
 
-def extract_local(block, sub_i, sub_j):
+def tricky_extract_cache(block, sub_i, sub_j):
     i, j = sch.get_loops(block)[-2:]
     i, kernel_i = sch.split(i, factors=[None, sub_i])
     j, kernel_j = sch.split(j, factors=[None, sub_j])
@@ -152,16 +157,21 @@ def extract_local(block, sub_i, sub_j):
     return (i, j, kernel_i, kernel_j)
 
 
-block_tricky_shared_local_A_loops = extract_local(
+block_tricky_shared_local_A_loops = tricky_extract_cache(
     block_tricky_shared_local_A, wmma_m, wmma_k)
-block_tricky_shared_local_B_loops = extract_local(
+block_tricky_shared_A_loops = tricky_extract_cache(
+    block_tricky_shared_A, wmma_m, wmma_k)
+block_tricky_shared_local_B_loops = tricky_extract_cache(
     block_tricky_shared_local_B, wmma_n, wmma_k)
-block_tricky_local_C_loops = extract_local(block_tricky_local_C, wmma_m, wmma_n)
+block_tricky_shared_B_loops = tricky_extract_cache(
+    block_tricky_shared_B, wmma_n, wmma_k)
+block_tricky_local_C_loops = tricky_extract_cache(
+    block_tricky_local_C, wmma_m, wmma_n)
 
-write_sch(sch, log_path, "schedule_local")
+write_sch(sch, log_path, "tricky_extract_cache")
 
 # 128x32
-A_shared_fused = sch.fuse(*sch.get_loops(block_tricky_shared_A)[-2:])
+A_shared_fused = sch.fuse(*sch.get_loops(block_tricky_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
     A_shared_fused, factors=[block_row_warps, block_col_warps, None, warp_size, vec])
 sch.vectorize(A_shared_vi)
@@ -170,7 +180,7 @@ sch.bind(A_shared_ty, "threadIdx.y")
 sch.bind(A_shared_tz, "threadIdx.z")
 write_sch(sch, log_path, "schedule_A_shared")
 
-B_shared_fused = sch.fuse(*sch.get_loops(block_tricky_shared_B)[-2:])
+B_shared_fused = sch.fuse(*sch.get_loops(block_tricky_shared_B)[-4:])
 B_shared_ty, B_shared_tz, B_shared_inner, B_shared_tx, B_shared_vi = sch.split(
     B_shared_fused, factors=[block_row_warps, block_col_warps, None, warp_size, vec])
 sch.vectorize(B_shared_vi)
