@@ -1,33 +1,3 @@
-"""
-    Improving the Performance of Matrix Multiplication on GPUs with TensorIR
-    What we need to do to optimized the code that we generated in this code?
-    change     
-    __asm__ __volatile__(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
-      "{%0, %1, %2, %3}, [%4];\n"
-      : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
-      : "r"(addr)
-    );
-    into 
-    __asm__ __volatile__(
-    "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
-    "{%0, %1, %2, %3}, [%4];\n"
-    : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
-    : "r"(addr)
-    );
-    
-    hands on vectorize the global store stage.
-    for (int ax0_2 = 0; ax0_2 < 2; ++ax0_2) {
-    for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0) {
-      for (int ax1_1 = 0; ax1_1 < 2; ++ax1_1) {
-        for (int local_id = 0; local_id < 8; ++local_id) {
-(&(C[(((((((((int)blockIdx.x) * 1048576) + (((int)threadIdx.y) * 524288)) + (ax0_2 * 262144)) + (((int)blockIdx.y) * 4096)) + (((int)threadIdx.z) * 1024)) + (ax1_0 * 512)) + (ax1_1 * 256))]))[((((((local_id % 4) / 2) * 8) + (threadIdx.x / 4)) * 16) + ((((local_id / 4) * 8) + ((threadIdx.x % 4) * 2)) + (local_id % 2)))] = C_warp[(((ax0_2 * 32) + (ax1_0 * 16)) + (ax1_1 * 8)) + local_id];
-}
-;
-      }
-    }
-  }
-"""
 import tvm
 import numpy as np
 import tvm.testing
@@ -70,31 +40,28 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = False
+VERIFY = True
 
-M = 1024
-N = 16384
-K = 4096
+M =16384
+N =16384
+K =16384
 if VERIFY:
     M = 256
     N = 2048
     K = 1024
 
 warp_size = 32
-block_row_warps = 4
-block_col_warps = 1
-warp_row_tiles = 2
-warp_col_tiles = 16
-# block_row_warps = 4
-# block_col_warps = 2
-# warp_row_tiles = 4
-# warp_col_tiles = 2
+block_row_warps = 1
+block_col_warps = 4
+warp_row_tiles = 8
+warp_col_tiles = 4
+double_buffer_stages = 1 # 1 is no double buffer 2 is double buffer enabled
 chunk = 2
 vec = 8
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-splitk = 8
+splitk = 16
 
 
 @tvm.script.ir_module
@@ -130,7 +97,7 @@ block_tricky_shared_local_A = sch.cache_read(block_b, 0, "warp")
 block_tricky_B = sch.cache_read(block_b, 1, "global")
 block_tricky_shared_B = sch.cache_read(block_b, 1, "shared")
 block_tricky_shared_local_B = sch.cache_read(block_b, 1, "warp")
-block_tricky_C = sch.cache_write(block_b, 0, "global")
+# block_tricky_C = sch.cache_write(block_b, 0, "global")
 block_tricky_local_C = sch.cache_write(block_b, 0, "warp")
 
 write_sch(sch, log_path, "cache_related")
@@ -157,7 +124,7 @@ sch.transform_layout(block_tricky_shared_local_A,
 sch.transform_layout(block_tricky_shared_local_B,
                      ("write", 0), tricky_transform_B)
 sch.transform_layout(block_b, ("write", 0), tricky_transform_C)
-sch.transform_layout(block_tricky_local_C, ("write", 0), tricky_transform_C)
+# sch.transform_layout(block_tricky_local_C, ("write", 0), tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform_kernel")
 
@@ -174,14 +141,15 @@ ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii,
             jj, kernel_i, kernel_j, kernel_k)
 
-block_k, block_j = sch.split(block_j, factors=[None, splitk])
+# block_k, block_j = sch.split(block_j, factors=[None, splitk])
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_k, "blockIdx.z")
+# sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
+sch.annotate(ko, ann_key="thread_rasterization", ann_val=splitk)
 
 write_sch(sch, log_path, "thread_bind")
 
@@ -300,12 +268,20 @@ def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
     if K <= 16384:
         fused_axis = sch.fuse(i, j)
-        bx, fused_inner, ty, tx, fused_vi = sch.split(
-            fused_axis, factors=[1024, None, 32, 32, vec])
+        # 16384
+        by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
+            fused_axis, factors=[8192, 32, 1, 1, 8, None, vec])
+        # 8192
+        # by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
+        #     fused_axis, factors=[256, 256, 4, 2, 8, None, vec])
+        
         sch.vectorize(fused_vi)
+        sch.bind(by, "blockIdx.y")
         sch.bind(bx, "blockIdx.x")
+        sch.bind(vx, "vthread.x")
         sch.bind(ty, "threadIdx.y")
         sch.bind(tx, "threadIdx.x")
+        # sch.unroll(fused_inner)
     else:
         bx, fused_inner, ty, tx, fused_vi = sch.split(
             j, factors=[1024, None, 32, 32, vec])
@@ -313,16 +289,16 @@ def schedule_tricky_transform(block, vec):
         sch.bind(bx, "blockIdx.x")
         sch.bind(ty, "threadIdx.y")
         sch.bind(tx, "threadIdx.x")
+    
 
 schedule_tricky_transform(block_tricky_A, vec=vec)
 schedule_tricky_transform(block_tricky_B, vec=vec)
-schedule_tricky_transform(block_tricky_C, vec=2)
+# schedule_tricky_transform(block_tricky_C, vec=2)
 
-# sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
-# sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+if double_buffer_stages == 2:
+    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
+    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
 
-# sch.annotate(k1, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
-# sch.annotate(k1, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
 
 # c_warp_o = sch.get_block("C_warp_o")
 # print(sch.get_loops(c_warp_o)[-1])

@@ -1,17 +1,38 @@
+'''
+Problem definition:
+    the mma version of tricky tensorize
+    Consider the following matrix multiplication:
+        C = A * B
+    where A, B, C are all 2D tensors.
+    A is of shape [M, K, 16, 32]
+    B is of shape [N, K, 16, 32]
+    C is of shape [M, N, 16, 16]
+    The tricky part is that the innermost dimension of A and B are contiguous.
+    We consider a single kernel of  BM=128, BN=128, BK=64
+'''
 import tvm
+from tvm import te
 import numpy as np
 import tvm.testing
 from tvm.script import tir as T
 import os
-from tvm.tir.tensor_intrin.cuda import (
-    WMMA_FILL_16x16x16_S32_INTRIN,
-    WMMA_LOAD_16x16x16_S8_A_INTRIN,
-    WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN,
-    WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN,
-    WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
+from intrin.tricky_mma_int8_int32 import (
+    TRICKY_MMA_fill_16x16_i32_INTRIN,
+    TRICKY_LDMATRIX_16x32_A_INTRIN,
+    TRICKY_LDMATRIX_32x16_B_INTRIN,
+    TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN,
+    TRICKY_MMA_i8i8i32_INTRIN,
+    TRICKY_MMA_i8i8i32_TRANS_INTRIN,
+    TRICKY_MMA_store_16x16_i32_global_INTRIN,
+    shared_16x16_to_ldmatrix_32x8_layout,
+    shared_32x16_to_ldmatrix_32x16_layout,
+    shared_16x32_to_ldmatrix_32x16_layout,
+    shared_16x32_to_ldmatrix_32x16_permutation,
+    A_global_16x32_to_shared_load_16x32_layout,
+    B_global_16x32_to_shared_load_16x32_layout,
 )
 
-log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nt"
+log_path = "progress/tensorirscript_imma/4.tricky_mma_int8_int32_nt"
 count = 0
 
 
@@ -35,21 +56,27 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
+VERIFY = False
+
 M = 16384
 N = 16384
 K = 16384
+if VERIFY:
+    M = 256
+    N = 256
+    K = 256
 
 warp_size = 32
 block_row_warps = 4
 block_col_warps = 1
 warp_row_tiles = 4
 warp_col_tiles = 4
-chunk = 4
+chunk = 2
+splitk = 16
 vec = 16
 wmma_m = 16
 wmma_n = 16
-wmma_k = 16
-split_k = 32
+wmma_k = 32
 
 @tvm.script.ir_module
 class MyModule:
@@ -80,16 +107,14 @@ write_sch(sch, log_path, "original")
 block_b = sch.get_block("B")
 block_tricky_A = sch.cache_read(block_b, 0, "global")
 block_tricky_shared_A = sch.cache_read(block_b, 0, "shared")
-block_tricky_shared_local_A = sch.cache_read(block_b, 0, "wmma.matrix_a")
+block_tricky_shared_local_A = sch.cache_read(block_b, 0, "warp")
 block_tricky_B = sch.cache_read(block_b, 1, "global")
 block_tricky_shared_B = sch.cache_read(block_b, 1, "shared")
-block_tricky_shared_local_B = sch.cache_read(block_b, 1, "wmma.matrix_b")
+block_tricky_shared_local_B = sch.cache_read(block_b, 1, "warp")
 # block_tricky_C = sch.cache_write(block_b, 0, "global")
-block_tricky_local_C = sch.cache_write(block_b, 0, "wmma.accumulator")
+block_tricky_local_C = sch.cache_write(block_b, 0, "warp")
 
 write_sch(sch, log_path, "cache_related")
-
-
 def tricky_transform_A(i, j):
     return (i // wmma_m, j // wmma_k, i % wmma_m, j % wmma_k)
 
@@ -112,7 +137,6 @@ sch.transform_layout(block_b, ("write", 0), tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform")
 
-
 (i, j, k) = sch.get_loops(block_b)
 i, kernel_i = sch.split(i, factors=[None, wmma_m])
 j, kernel_j = sch.split(j, factors=[None, wmma_n])
@@ -125,15 +149,14 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
-block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_k, "blockIdx.z")
-sch.bind(block_i, "blockIdx.y")
-sch.bind(block_j, "blockIdx.x")
+sch.bind(block_i, "blockIdx.x")
+sch.bind(block_j, "blockIdx.y")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
+sch.annotate(ko, ann_key="thread_rasterization", ann_val=splitk)
 
 write_sch(sch, log_path, "thread_bind")
 
@@ -145,7 +168,6 @@ sch.compute_at(block_tricky_shared_local_B, ki)
 sch.compute_at(block_tricky_shared_B, ko)
 sch.reverse_compute_at(block_tricky_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
-
 
 def tricky_extract_cache(block, sub_i, sub_j):
     i, j = sch.get_loops(block)[-2:]
@@ -169,6 +191,21 @@ block_tricky_local_C_loops = tricky_extract_cache(
 write_sch(sch, log_path, "tricky_extract_cache")
 
 # 128x32
+# sch.transform_layout(block_b, ("write", 0), permutation)
+def permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+
+
+def B_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *B_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+
+sch.transform_layout(block_tricky_shared_A, ("read", 0),
+                     permutation)
+sch.transform_layout(block_tricky_shared_B, ("read", 0),
+                     B_permutation)
+
+write_sch(sch, log_path, "transform_layout")
+
 A_shared_fused = sch.fuse(*sch.get_loops(block_tricky_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
     A_shared_fused, factors=[block_row_warps, block_col_warps, None, warp_size, vec])
@@ -185,29 +222,51 @@ sch.vectorize(B_shared_vi)
 sch.bind(B_shared_tx, "threadIdx.x")
 sch.bind(B_shared_ty, "threadIdx.y")
 sch.bind(B_shared_tz, "threadIdx.z")
-
 write_sch(sch, log_path, "schedule_B_shared")
+
 
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
 write_sch(sch, log_path, "decompose_reduction")
 
-sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
+# transform layout
+
+def index_map_A(i, k, wmma_m, wmma_k):
+    return (i, k, *shared_16x32_to_ldmatrix_32x16_layout(wmma_m, wmma_k), )
+
+def index_map_B(j, k, wmma_n, wmma_k):
+    return (j, k, *shared_16x32_to_ldmatrix_32x16_layout(wmma_n, wmma_k), )
+
+def index_map_C(i, j, wmma_m, wmma_n):
+    return (i, j, *shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n), )
+
+
+
+
+sch.transform_layout(block_tricky_shared_local_A, ("write", 0), index_map_A)
+sch.transform_layout(block_tricky_shared_local_B, ("write", 0), index_map_A)
+sch.transform_layout(block_tricky_local_C, ("read", 0), index_map_C)
+write_sch(sch, log_path, "transform_layout")
+
+init_block_b_i, init_block_b_j = sch.get_loops(init_block_b)[-4:-2]
+sch.tensorize(sch.get_loops(init_block_b)[-2], TRICKY_MMA_fill_16x16_i32_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_S8_A_INTRIN)
+block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(block_tricky_shared_local_A)[-4:-2]
+sch.tensorize(sch.get_loops(block_tricky_shared_local_A)
+              [-2], TRICKY_LDMATRIX_16x32_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN)
-sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN)
-sch.tensorize(sch.get_loops(block_tricky_local_C)
-              [-2], WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN)
+block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(block_tricky_shared_local_B)[-4:-2]
+sch.tensorize(sch.get_loops(block_tricky_shared_local_B)
+              [-2], TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN)
+sch.tensorize(kernel_i, TRICKY_MMA_i8i8i32_TRANS_INTRIN)
+
+sch.tensorize(sch.get_loops(block_tricky_local_C)[-2], TRICKY_MMA_store_16x16_i32_global_INTRIN)
 write_sch(sch, log_path,
            "tensorize")
 
-# unroll
-write_sch(sch, log_path,
-           "do_unroll")
+# schdule tricky transform
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
@@ -215,7 +274,7 @@ def schedule_tricky_transform(block, vec):
         fused_axis = sch.fuse(i, j)
         # 16384
         by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
-            fused_axis, factors=[4, 2048, 1, 128, 8, None, vec])
+            fused_axis, factors=[8192, 32, 1, 1, 8, None, vec])
         # 8192
         # by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
         #     fused_axis, factors=[256, 256, 4, 2, 8, None, vec])
@@ -237,17 +296,50 @@ def schedule_tricky_transform(block, vec):
 
 schedule_tricky_transform(block_tricky_A, vec=vec)
 schedule_tricky_transform(block_tricky_B, vec=vec)
-# schedule_tricky_transform(block_tricky_C, vec=4)
+# unroll
+# sch.unroll(init_block_b_i)
+# sch.unroll(init_block_b_j)
+# sch.unroll(block_shared_local_A_i)
+# sch.unroll(block_shared_local_A_j)
+# sch.unroll(block_shared_local_B_i)
+# sch.unroll(block_shared_local_B_j)
+# sch.unroll(ii)
+# sch.unroll(jj)
+# sch.unroll(A_shared_inner)
+# sch.unroll(B_shared_inner)
+
+
+write_sch(sch, log_path,
+           "do_unroll")
+
 
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((N, K)).astype("int8"), ctx)
-cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
-cuda_mod(cuda_a, cuda_b, cuda_c)
+# a_np = (np.ones(
+#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k)) * 2).astype("int8")
+a_np = (np.random.rand
+    (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
+
+# b_np = (np.ones(
+#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+b_np = (np.random.rand(
+    N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
+cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
+cuda_c = tvm.nd.array(
+    np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("int32"), ctx)
+
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
+    b_np = b_np.transpose((0, 2, 1, 3)).reshape(N, K)
+    c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    np.testing.assert_allclose(
+        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32").T), rtol=1e-4, atol=1e-4
+    )
 
 num_flops = 2 * M * K * N
 num_runs = 1

@@ -6,12 +6,14 @@ import os
 from tvm.tir.tensor_intrin.cuda import (
     WMMA_FILL_16x16x16_S32_INTRIN,
     WMMA_LOAD_16x16x16_S8_A_INTRIN,
+    WMMA_LOAD_16x16x16_S8_B_INTRIN,
     WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN,
+    WMMA_SYNC_16x16x16_s8s8s32_INTRIN,
     WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN,
     WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nt"
+log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nn"
 count = 0
 
 
@@ -35,21 +37,28 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-M = 16384
-N = 16384
-K = 16384
+VERIFY = False
+
+M =16384
+N =16384
+K =16384
+if VERIFY:
+    M = 2048
+    N = 2048
+    K = 2048
 
 warp_size = 32
-block_row_warps = 4
-block_col_warps = 1
-warp_row_tiles = 4
-warp_col_tiles = 4
-chunk = 4
+block_row_warps = 1
+block_col_warps = 4
+warp_row_tiles = 8
+warp_col_tiles = 2
+chunk = 2
 vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-split_k = 32
+raster = 1
+stage = 2
 
 @tvm.script.ir_module
 class MyModule:
@@ -57,7 +66,7 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [N, K], dtype="int8")
+        B = T.match_buffer(b, [K, N], dtype="int8")
         C = T.match_buffer(c, [M, N], dtype="int32")
 
         for i, j, k  in T.grid(M, N, K):
@@ -66,7 +75,7 @@ class MyModule:
                 with T.init():
                     C[vi, vj] = 0
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("int32") * B[vj, vk].astype("int32")
+                    A[vi, vk].astype("int32") * B[vk, vj].astype("int32")
 
 
 ir_module = MyModule
@@ -95,7 +104,7 @@ def tricky_transform_A(i, j):
 
 
 def tricky_transform_B(i, j):
-    return (i // wmma_n, j // wmma_k, i % wmma_n, j % wmma_k)
+    return (i // wmma_k, j // wmma_n, i % wmma_k, j % wmma_n)
 
 
 def tricky_transform_C(i, j):
@@ -125,11 +134,9 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
-block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -191,15 +198,15 @@ write_sch(sch, log_path, "schedule_B_shared")
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
 write_sch(sch, log_path, "decompose_reduction")
-
-sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
+init_block_b_loops = sch.get_loops(init_block_b)
+sch.tensorize(init_block_b_loops[-2], WMMA_FILL_16x16x16_S32_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
 sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_S8_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN)
-sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN)
+sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_INTRIN)
+sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_INTRIN)
 sch.tensorize(sch.get_loops(block_tricky_local_C)
               [-2], WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN)
 write_sch(sch, log_path,
@@ -208,6 +215,11 @@ write_sch(sch, log_path,
 # unroll
 write_sch(sch, log_path,
            "do_unroll")
+if stage == 2:
+    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
+    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+if raster > 0:
+    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
@@ -244,10 +256,34 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((N, K)).astype("int8"), ctx)
-cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
+a_np = (np.ones(
+    (M, K))).astype("int8")
+# a_np = np.arange(M * K).reshape(M // wmma_m, K //
+#                                 wmma_k, wmma_m, wmma_k).astype("int8")
+# a_np = (np.random.rand
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("int8")
+
+# b_np = (np.ones(
+#     (K // wmma_k, N // wmma_n,  wmma_k, wmma_n))).astype("int8")
+# b_np = np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n).astype("int8")
+
+b_np = np.mod(np.arange(N * K).reshape(K, N), 4).astype("int8")
+# print(b_np)
+# b_np = (np.random.rand(
+#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
+
+cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
+cuda_c = tvm.nd.array(
+    np.zeros((M, N)).astype("int32"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
+# print(cuda_c.asnumpy())
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    c_np = cuda_c.numpy()
+    np.testing.assert_allclose(
+        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32")), rtol=1e0, atol=1e0
+    )
 
 num_flops = 2 * M * K * N
 num_runs = 1

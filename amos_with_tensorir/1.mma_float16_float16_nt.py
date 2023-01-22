@@ -101,7 +101,7 @@ block_tricky_shared_local_A = sch.cache_read(block_b, 0, "warp")
 block_tricky_B = sch.cache_read(block_b, 1, "global")
 block_tricky_shared_B = sch.cache_read(block_b, 1, "shared")
 block_tricky_shared_local_B = sch.cache_read(block_b, 1, "warp")
-block_tricky_C = sch.cache_write(block_b, 0, "global")
+# block_tricky_C = sch.cache_write(block_b, 0, "global")
 block_tricky_local_C = sch.cache_write(block_b, 0, "warp")
 
 write_sch(sch, log_path, "cache_related")
@@ -128,7 +128,7 @@ sch.transform_layout(block_tricky_shared_local_A,
 sch.transform_layout(block_tricky_shared_local_B,
                      ("write", 0), tricky_transform_B)
 sch.transform_layout(block_b, ("write", 0), tricky_transform_C)
-sch.transform_layout(block_tricky_local_C, ("write", 0), tricky_transform_C)
+# sch.transform_layout(block_tricky_local_C, ("write", 0), tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform_kernel")
 
@@ -269,17 +269,24 @@ write_sch(sch, log_path,
 
 # schdule tricky transform
 
-
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
     if K <= 16384:
         fused_axis = sch.fuse(i, j)
-        bx, fused_inner, ty, tx, fused_vi = sch.split(
-            fused_axis, factors=[1024, None, 32, 32, vec])
+        # 16384
+        by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
+            fused_axis, factors=[8192, 32, 1, 1, 8, None, vec])
+        # 8192
+        # by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
+        #     fused_axis, factors=[256, 256, 4, 2, 8, None, vec])
+        
         sch.vectorize(fused_vi)
+        sch.bind(by, "blockIdx.y")
         sch.bind(bx, "blockIdx.x")
+        sch.bind(vx, "vthread.x")
         sch.bind(ty, "threadIdx.y")
         sch.bind(tx, "threadIdx.x")
+        # sch.unroll(fused_inner)
     else:
         bx, fused_inner, ty, tx, fused_vi = sch.split(
             j, factors=[1024, None, 32, 32, vec])
@@ -290,7 +297,7 @@ def schedule_tricky_transform(block, vec):
 
 schedule_tricky_transform(block_tricky_A, vec=vec)
 schedule_tricky_transform(block_tricky_B, vec=vec)
-schedule_tricky_transform(block_tricky_C, vec=2)
+# schedule_tricky_transform(block_tricky_C, vec=2)
 
 # sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
 # sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
