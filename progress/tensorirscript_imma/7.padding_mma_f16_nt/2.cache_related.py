@@ -1,0 +1,15 @@
+# from tvm.script import tir as T
+@T.prim_func
+def func(A: T.Buffer[(256, 256), "float16"], B: T.Buffer[(256, 256), "float16"], C: T.Buffer[(256, 256), "float16"]):
+    # function attr dict
+    T.func_attr({"tir.noalias": True, "global_symbol": "main"})
+    # body
+    # with T.block("root")
+    for i, j, k in T.grid(256, 256, 256):
+        with T.block("B"):
+            vi, vj, vk = T.axis.remap("SSR", [i, j, k])
+            T.reads(A[vi, vk], B[vj, vk])
+            T.writes(C[vi, vj])
+            with T.init():
+                C[vi, vj] = T.float16(0)
+            C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vj, vk]

@@ -1,0 +1,90 @@
+@main = primfn(A_1: handle, B_1: handle, C_1: handle) -> ()
+  attr = {"from_legacy_te_schedule": True, "global_symbol": "main", "tir.noalias": True}
+  buffers = {A: Buffer(A_2: Pointer(int8), int8, [268435456], []),
+             B: Buffer(B_2: Pointer(int8), int8, [268435456], []),
+             C: Buffer(C_2: Pointer(int32), int32, [268435456], [])}
+  buffer_map = {A_1: A, B_1: B, C_1: C}
+  preflattened_buffer_map = {A_1: A_3: Buffer(A_2, int8, [1024, 1024, 16, 16], []), B_1: B_3: Buffer(B_2, int8, [1024, 1024, 16, 16], []), C_1: C_3: Buffer(C_2, int32, [1024, 1024, 16, 16], [])} {
+  allocate(A.shared: Pointer(shared int8), int8, [268435456i64]), storage_scope = shared;
+  allocate(A.shared.wmma.matrix_a: Pointer(wmma.matrix_a int8), int8, [268435456]), storage_scope = wmma.matrix_a;
+  allocate(B.shared.wmma.matrix_b: Pointer(wmma.matrix_b int8), int8, [268435456]), storage_scope = wmma.matrix_b;
+  allocate(C.wmma.accumulator: Pointer(wmma.accumulator int32), int32, [268435456]), storage_scope = wmma.accumulator {
+    for (ax0: int32, 0, 1024) {
+      for (ax1: int32, 0, 1024) {
+        for (ax2: int32, 0, 16) {
+          for (ax3: int32, 0, 16) {
+            let cse_var_1: int32 = ((((ax0*262144) + (ax1*256)) + (ax2*16)) + ax3)
+            A.shared_1: Buffer(A.shared, int8, [268435456], [], scope="shared")[cse_var_1] = A[cse_var_1]
+          }
+        }
+      }
+    }
+    for (ax0_1: int32, 0, 1024) {
+      for (ax1_1: int32, 0, 1024) {
+        for (ax2_1: int32, 0, 16) {
+          for (ax3_1: int32, 0, 16) {
+            let cse_var_2: int32 = ((((ax0_1*262144) + (ax1_1*256)) + (ax2_1*16)) + ax3_1)
+            A.shared.wmma.matrix_a_1: Buffer(A.shared.wmma.matrix_a, int8, [268435456], [], scope="wmma.matrix_a")[cse_var_2] = A.shared_1[cse_var_2]
+          }
+        }
+      }
+    }
+    for (ax0_2: int32, 0, 1024) {
+      for (ax1_2: int32, 0, 1024) {
+        for (ax2_2: int32, 0, 16) {
+          for (ax3_2: int32, 0, 16) {
+            let cse_var_3: int32 = ((((ax0_2*262144) + (ax1_2*256)) + (ax2_2*16)) + ax3_2)
+            A.shared_2: Buffer(A.shared, int8, [268435456], [], scope="shared")[cse_var_3] = B[cse_var_3]
+          }
+        }
+      }
+    }
+    for (ax0_3: int32, 0, 1024) {
+      for (ax1_3: int32, 0, 1024) {
+        for (ax2_3: int32, 0, 16) {
+          for (ax3_3: int32, 0, 16) {
+            let cse_var_4: int32 = ((((ax0_3*262144) + (ax1_3*256)) + (ax2_3*16)) + ax3_3)
+            B.shared.wmma.matrix_b_1: Buffer(B.shared.wmma.matrix_b, int8, [268435456], [], scope="wmma.matrix_b")[cse_var_4] = A.shared_2[cse_var_4]
+          }
+        }
+      }
+    }
+    for (i.c: int32, 0, 1024) {
+      for (j.c: int32, 0, 1024) {
+        for (ii.c: int32, 0, 16) {
+          for (jj.c: int32, 0, 16) {
+            C.wmma.accumulator_1: Buffer(C.wmma.accumulator, int32, [268435456], [], scope="wmma.accumulator")[((((i.c*262144) + (j.c*256)) + (ii.c*16)) + jj.c)] = 0
+            for (k1: int32, 0, 1024) {
+              for (k2: int32, 0, 16) {
+                let cse_var_8: int32 = (i.c*262144)
+                let cse_var_7: int32 = (ii.c*16)
+                let cse_var_6: int32 = (k1*256)
+                let cse_var_5: int32 = (((cse_var_8 + (j.c*256)) + cse_var_7) + jj.c)
+                C.wmma.accumulator_1[cse_var_5] = (C.wmma.accumulator_1[cse_var_5] + (cast(int32, A.shared.wmma.matrix_a_1[(((cse_var_8 + cse_var_6) + cse_var_7) + k2)])*cast(int32, B.shared.wmma.matrix_b_1[((((j.c*262144) + cse_var_6) + (jj.c*16)) + k2)])))
+              }
+            }
+          }
+        }
+      }
+    }
+    for (i.outer.outer: int32, 0, 256) {
+      for (j.outer.outer: int32, 0, 64) {
+        for (i.outer.inner: int32, 0, 2) {
+          for (j.outer.inner: int32, 0, 2) {
+            for (i.inner: int32, 0, 2) {
+              for (j.inner: int32, 0, 8) {
+                for (ii: int32, 0, 16) {
+                  for (jj: int32, 0, 16) {
+                    let cse_var_9: int32 = ((((((((i.outer.outer*1048576) + (i.outer.inner*524288)) + (i.inner*262144)) + (j.outer.outer*4096)) + (j.outer.inner*2048)) + (j.inner*256)) + (ii*16)) + jj)
+                    C[cse_var_9] = C.wmma.accumulator_1[cse_var_9]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+

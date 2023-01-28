@@ -1,0 +1,192 @@
+#[version = "0.0.5"]
+@main = primfn(a: handle, b: handle, c: handle) -> ()
+  attr = {"tir.noalias": True, "global_symbol": "main"}
+  buffers = {A: Buffer(A_1: Pointer(global int8), int8, [16384, 16384], []),
+             B: Buffer(B_1: Pointer(global int8), int8, [16384, 16384], []),
+             C: Buffer(C_1: Pointer(global int8), int8, [16384, 16384], [])}
+  buffer_map = {a: A, b: B, c: C} {
+  block([], "root") {
+    tir.reads([])
+    tir.writes([])
+    QA = alloc_buffer(int8[16384, 16384])
+    QB = alloc_buffer(int8[16384, 16384])
+    A_global = alloc_buffer(int8[16384, 16384])
+    QA_local = alloc_buffer(int8[16384, 16384])
+    QA_local_shared = alloc_buffer(int8[16384, 16384])
+    QA_local_shared_wmma.matrix_a = alloc_buffer(int8[16384, 16384])
+    B_global = alloc_buffer(int8[16384, 16384])
+    QB_local = alloc_buffer(int8[16384, 16384])
+    QB_local_shared = alloc_buffer(int8[16384, 16384])
+    QB_local_shared_wmma.matrix_b = alloc_buffer(int8[16384, 16384])
+    QC_shared = alloc_buffer(int32[16384, 16384])
+    QC_shared_wmma.accumulator = alloc_buffer(int32[16384, 16384])
+     {
+      for (ax0: int32, 0, 16384) {
+        for (ax1: int32, 0, 16384) {
+          block([16384, 16384], "B_global") as [v0, v1] {
+            bind(v0, ax0)
+            bind(v1, ax1)
+            tir.reads([B[v0, v1]])
+            tir.writes([B_global[v0, v1]])
+            B_global[v0, v1] = B[v0, v1]
+        }
+      }
+      for (ax0_1: int32, 0, 16384) {
+        for (ax1_1: int32, 0, 16384) {
+          block([16384, 16384], "A_global") as [v0_1, v1_1] {
+            bind(v0_1, ax0_1)
+            bind(v1_1, ax1_1)
+            tir.reads([A[v0_1, v1_1]])
+            tir.writes([A_global[v0_1, v1_1]])
+            A_global[v0_1, v1_1] = A[v0_1, v1_1]
+        }
+      }
+      for (i: int32, 0, 16384) {
+        for (j: int32, 0, 16384) {
+          block([16384, 16384], "Quantize_A") as [vi, vj] {
+            bind(vi, i)
+            bind(vj, j)
+            tir.reads([A_global[vi, vj]])
+            tir.writes([QA[vi, vj]])
+            QA[vi, vj] = cast(int8, (@tir.round((cast(float32, A_global[vi, vj])*0.5f32), dtype=float32) - 0f32))
+        }
+      }
+      for (i_1: int32, 0, 16384) {
+        for (j_1: int32, 0, 16384) {
+          block([16384, 16384], "Quantize_B") as [vi_1, vj_1] {
+            bind(vi_1, i_1)
+            bind(vj_1, j_1)
+            tir.reads([B_global[vi_1, vj_1]])
+            tir.writes([QB[vi_1, vj_1]])
+            QB[vi_1, vj_1] = cast(int8, (@tir.round((cast(float32, B_global[vi_1, vj_1])*0.1f32), dtype=float32) - 0f32))
+        }
+      }
+      for (ax0_2: int32, 0, 16384) {
+        for (ax1_2: int32, 0, 16384) {
+          block([16384, 16384], "QA_local") as [v0_2, v1_2] {
+            bind(v0_2, ax0_2)
+            bind(v1_2, ax1_2)
+            tir.reads([QA[v0_2, v1_2]])
+            tir.writes([QA_local[v0_2, v1_2]])
+            QA_local[v0_2, v1_2] = QA[v0_2, v1_2]
+        }
+      }
+      for (ax0_3: int32, 0, 16384) {
+        for (ax1_3: int32, 0, 16384) {
+          block([16384, 16384], "QA_local_shared") as [v0_3, v1_3] {
+            bind(v0_3, ax0_3)
+            bind(v1_3, ax1_3)
+            tir.reads([QA_local[v0_3, v1_3]])
+            tir.writes([QA_local_shared[v0_3, v1_3]])
+            QA_local_shared[v0_3, v1_3] = QA_local[v0_3, v1_3]
+        }
+      }
+      for (ax0_4: int32, 0, 16384) {
+        for (ax1_4: int32, 0, 16384) {
+          block([16384, 16384], "QA_local_shared_wmma.matrix_a") as [v0_4, v1_4] {
+            bind(v0_4, ax0_4)
+            bind(v1_4, ax1_4)
+            tir.reads([QA_local_shared[v0_4, v1_4]])
+            tir.writes([QA_local_shared_wmma.matrix_a[v0_4, v1_4]])
+            QA_local_shared_wmma.matrix_a[v0_4, v1_4] = QA_local_shared[v0_4, v1_4]
+        }
+      }
+      for (ax0_5: int32, 0, 16384) {
+        for (ax1_5: int32, 0, 16384) {
+          block([16384, 16384], "QB_local") as [v0_5, v1_5] {
+            bind(v0_5, ax0_5)
+            bind(v1_5, ax1_5)
+            tir.reads([QB[v0_5, v1_5]])
+            tir.writes([QB_local[v0_5, v1_5]])
+            QB_local[v0_5, v1_5] = QB[v0_5, v1_5]
+        }
+      }
+      for (ax0_6: int32, 0, 16384) {
+        for (ax1_6: int32, 0, 16384) {
+          block([16384, 16384], "QB_local_shared") as [v0_6, v1_6] {
+            bind(v0_6, ax0_6)
+            bind(v1_6, ax1_6)
+            tir.reads([QB_local[v0_6, v1_6]])
+            tir.writes([QB_local_shared[v0_6, v1_6]])
+            QB_local_shared[v0_6, v1_6] = QB_local[v0_6, v1_6]
+        }
+      }
+      for (ax0_7: int32, 0, 16384) {
+        for (ax1_7: int32, 0, 16384) {
+          block([16384, 16384], "QB_local_shared_wmma.matrix_b") as [v0_7, v1_7] {
+            bind(v0_7, ax0_7)
+            bind(v1_7, ax1_7)
+            tir.reads([QB_local_shared[v0_7, v1_7]])
+            tir.writes([QB_local_shared_wmma.matrix_b[v0_7, v1_7]])
+            QB_local_shared_wmma.matrix_b[v0_7, v1_7] = QB_local_shared[v0_7, v1_7]
+        }
+      }
+      for (i_2: int32, 0, 16384) {
+        for (j_2: int32, 0, 16384) {
+          for (k: int32, 0, 16384) {
+            block([16384, 16384, tir.reduce_axis(0, 16384)], "B") as [vi_2, vj_2, vk] {
+              bind(vi_2, i_2)
+              bind(vj_2, j_2)
+              bind(vk, k)
+              tir.reads([QA_local_shared_wmma.matrix_a[vi_2, vk], QB_local_shared_wmma.matrix_b[vj_2, vk]])
+              tir.writes([QC_shared_wmma.accumulator[vi_2, vj_2]])
+              with init() {
+                QC_shared_wmma.accumulator[vi_2, vj_2] = 0
+              }
+              QC_shared_wmma.accumulator[vi_2, vj_2] = (QC_shared_wmma.accumulator[vi_2, vj_2] + (cast(int32, QA_local_shared_wmma.matrix_a[vi_2, vk])*cast(int32, QB_local_shared_wmma.matrix_b[vj_2, vk])))
+          }
+        }
+      }
+      for (ax0_8: int32, 0, 16384) {
+        for (ax1_8: int32, 0, 16384) {
+          block([16384, 16384], "QC_shared_wmma.accumulator") as [v0_8, v1_8] {
+            bind(v0_8, ax0_8)
+            bind(v1_8, ax1_8)
+            tir.reads([QC_shared_wmma.accumulator[v0_8, v1_8]])
+            tir.writes([QC_shared[v0_8, v1_8]])
+            QC_shared[v0_8, v1_8] = QC_shared_wmma.accumulator[v0_8, v1_8]
+        }
+      }
+      for (ax0_9: int32, 0, 16384) {
+        for (ax1_9: int32, 0, 16384) {
+          block([16384, 16384], "QC_shared") as [v0_9, v1_9] {
+            bind(v0_9, ax0_9)
+            bind(v1_9, ax1_9)
+            tir.reads([QC_shared[v0_9, v1_9]])
+            tir.writes([C[v0_9, v1_9]])
+            C[v0_9, v1_9] = cast(int8, ((cast(float32, QC_shared[v0_9, v1_9]) / 0.01f32) + 0f32))
+        }
+      }
+    }
+}
+
+#[metadata]
+{
+  "root": 1, 
+  "nodes": [
+    {
+      "type_key": ""
+    }, 
+    {
+      "type_key": "Map", 
+      "keys": [
+        "IntImm"
+      ], 
+      "data": [2]
+    }, 
+    {
+      "type_key": "Array", 
+      "data": [3]
+    }, 
+    {
+      "type_key": "IntImm", 
+      "attrs": {
+        "dtype": "bool", 
+        "span": "0", 
+        "value": "1"
+      }
+    }
+  ], 
+  "b64ndarrays": [], 
+  "attrs": {"tvm_version": "0.11.dev0"}
+}
