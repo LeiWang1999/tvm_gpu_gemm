@@ -65,8 +65,8 @@ N = 16384
 K = 16384
 if VERIFY:
     M = 256
-    N = 256
-    K = 256
+    N = 2048
+    K = 1024
 
 warp_size = 32
 block_row_warps = 4

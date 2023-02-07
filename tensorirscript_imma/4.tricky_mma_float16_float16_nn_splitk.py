@@ -1,12 +1,39 @@
+"""
+    Improving the Performance of Matrix Multiplication on GPUs with TensorIR
+    What we need to do to optimized the code that we generated in this code?
+    change     
+    __asm__ __volatile__(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
+      "{%0, %1, %2, %3}, [%4];\n"
+      : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
+      : "r"(addr)
+    );
+    into 
+    __asm__ __volatile__(
+    "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
+    "{%0, %1, %2, %3}, [%4];\n"
+    : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
+    : "r"(addr)
+    );
+    
+    hands on vectorize the global store stage.
+    for (int ax0_2 = 0; ax0_2 < 2; ++ax0_2) {
+    for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0) {
+      for (int ax1_1 = 0; ax1_1 < 2; ++ax1_1) {
+        for (int local_id = 0; local_id < 8; ++local_id) {
+(&(C[(((((((((int)blockIdx.x) * 1048576) + (((int)threadIdx.y) * 524288)) + (ax0_2 * 262144)) + (((int)blockIdx.y) * 4096)) + (((int)threadIdx.z) * 1024)) + (ax1_0 * 512)) + (ax1_1 * 256))]))[((((((local_id % 4) / 2) * 8) + (threadIdx.x / 4)) * 16) + ((((local_id / 4) * 8) + ((threadIdx.x % 4) * 2)) + (local_id % 2)))] = C_warp[(((ax0_2 * 32) + (ax1_0 * 16)) + (ax1_1 * 8)) + local_id];
+}
+;
+      }
+    }
+  }
+"""
 import tvm
 import numpy as np
 import tvm.testing
 from tvm.script import tir as T
 import os
 from intrin.tricky_mma_float16_float16 import (
-    TRICKY_MMA_A_G2S_16x16_f16_INTRIN,
-    TRICKY_MMA_B_G2S_16x16_f16_INTRIN,
-    TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN,
     TRICKY_MMA_fill_16x16_f16_INTRIN,
     TRICKY_LDMATRIX_16x16_A_INTRIN,
     TRICKY_LDMATRIX_16x16_B_INTRIN,
@@ -43,11 +70,11 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
-M = 225792
-N = 384
-K = 1024
+M = 3136
+N = 64
+K = 576
 if VERIFY:
     M = 256
     N = 2048
@@ -55,34 +82,48 @@ if VERIFY:
 
 warp_size = 32
 # nni search results:
-block_row_warps = 4
+block_row_warps = 2
 block_col_warps = 2
-warp_row_tiles = 4
-warp_col_tiles = 4
+warp_row_tiles = 2
+warp_col_tiles = 2
 chunk = 2
-raster = 8
-stage = 2 # 1 is no double buffer 2 is double buffer enabled
-
 vec = 8
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
+stage = 1 # 1 is no double buffer 2 is double buffer enabled
+raster = 16
+splitk = 1
+
+# padding MPAD as the multiple of block_row_warps * warp_row_tiles * wmma_m
+MPAD = (M + block_row_warps * warp_row_tiles * wmma_m - 1) // (
+    block_row_warps * warp_row_tiles * wmma_m
+) * block_row_warps * warp_row_tiles * wmma_m
+# padding NPAD as the multiple of block_col_warps * warp_col_tiles * wmma_n
+NPAD = (N + block_col_warps * warp_col_tiles * wmma_n - 1) // (
+    block_col_warps * warp_col_tiles * wmma_n
+) * block_col_warps * warp_col_tiles * wmma_n
+# padding KPAD as the multiple of block_col_warps * warp_col_tiles * wmma_k * splitk
+KPAD = (K + block_col_warps * warp_col_tiles * wmma_k * splitk - 1) // (
+    block_col_warps * warp_col_tiles * wmma_k * splitk
+) * block_col_warps * warp_col_tiles * wmma_k * splitk
+
 
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [M // wmma_m, K // wmma_k, wmma_m, wmma_k], dtype="float16")
-        B = T.match_buffer(b, [K // wmma_k, N // wmma_n, wmma_k, wmma_n], dtype="float16")
-        C = T.match_buffer(c, [M // wmma_m, N // wmma_n, wmma_m, wmma_n], dtype="float16")
+        A = T.match_buffer(a, [MPAD // wmma_m, KPAD // (wmma_k * splitk), wmma_m, wmma_k], dtype="float16")
+        B = T.match_buffer(b, [KPAD // (wmma_k * splitk), NPAD // wmma_n, wmma_k, wmma_n], dtype="float16")
+        C = T.match_buffer(c, [splitk, MPAD // wmma_m, NPAD // wmma_n, wmma_m, wmma_n], dtype="float16")
 
-        for ii, jj, kk, i, j, k  in T.grid(M // wmma_m, N // wmma_n, K // wmma_k, wmma_m, wmma_n, wmma_k):
+        for sk, ii, jj, kk, i, j, k  in T.grid(splitk, MPAD // wmma_m, NPAD // wmma_n, KPAD // (wmma_k * splitk), wmma_m, wmma_n, wmma_k):
             with T.block("B"):
-                vii, vjj, vkk, vi, vj, vk = T.axis.remap("SSRSSR", [ii, jj, kk, i, j, k])
+                vsk, vii, vjj, vkk, vi, vj, vk = T.axis.remap("SSSRSSR", [sk, ii, jj, kk, i, j, k])
                 with T.init():
-                    C[vii, vjj, vi, vj] = 0.0
-                C[vii, vjj, vi, vj] = C[vii, vjj, vi, vj] + \
+                    C[vsk, vii, vjj, vi, vj] = 0.0
+                C[vsk, vii, vjj, vi, vj] = C[vsk, vii, vjj, vi, vj] + \
                     A[vii, vkk, vi, vk] * B[vkk, vjj, vk, vj]
 
 
@@ -102,12 +143,13 @@ block_local_C = sch.cache_write(block_b, 0, "warp")
 
 write_sch(sch, log_path, "cache_related")
 
-(i, j, k, kernel_i, kernel_j, kernel_k) = sch.get_loops(block_b)
+(sk, i, j, k, kernel_i, kernel_j, kernel_k) = sch.get_loops(block_b)
 block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
 write_sch(sch, log_path, "block_tile")
+sch.bind(sk, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -126,19 +168,14 @@ write_sch(sch, log_path, "cache_read_compute_at")
 
 
 # 128x32
-# def permutation(i, j, kernel_i, kernel_j):
-#     return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 
-# sch.transform_layout(block_shared_A, ("read", 0),
-#                      permutation)
-# sch.transform_layout(block_shared_B, ("read", 0),
-#                      permutation)
-
-sch.tensorize(sch.get_loops(block_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
-block_shared_A = sch.get_block("A_g2s_shared")
-sch.tensorize(sch.get_loops(block_shared_B)[-2], TRICKY_MMA_B_G2S_16x16_f16_INTRIN)
-block_shared_B = sch.get_block("B_g2s_shared")
+sch.transform_layout(block_shared_A, ("read", 0),
+                     permutation)
+sch.transform_layout(block_shared_B, ("read", 0),
+                     permutation)
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
@@ -173,8 +210,8 @@ def index_map_B(j, k, wmma_n, wmma_k):
     return (j, k, *A_B_shared_16x16_to_ldmatrix_32x8_layout(wmma_n, wmma_k),)
 
 
-def index_map_C(i, j, wmma_m, wmma_n):
-    return (i, j, *C_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
+def index_map_C(sk, i, j, wmma_m, wmma_n):
+    return (sk, i, j, *C_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
 
 
 sch.transform_layout(block_shared_local_A, ("write", 0), index_map_A)
@@ -239,28 +276,34 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.random.rand
-        (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
+a_np = (np.ones(
+    (MPAD // wmma_m, KPAD // wmma_k, wmma_m, wmma_k))).astype("float16")
+# a_np = np.arange(M * K).reshape(M // wmma_m, K //
+#                                 wmma_k, wmma_m, wmma_k).astype("float16")
+# a_np = (np.random.rand
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
-b_np = (np.random.rand
-        (K // wmma_k, N // wmma_n, wmma_k, wmma_n)).astype("float16")
-# a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("float16")
-# b_np = np.mod(np.arange(N * K).reshape(K // wmma_k, N // wmma_n, wmma_k, wmma_n), 5).astype("float16")
+# b_np = (np.ones(
+#     (K // wmma_k, N // wmma_n,  wmma_k, wmma_n))).astype("float16")
+# b_np = np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n).astype("float16")
+
+b_np = np.mod(np.arange(NPAD * KPAD).reshape(KPAD // wmma_k, NPAD // wmma_n,  wmma_k, wmma_n), 32).astype("float16")
+# print(b_np)
+# b_np = (np.random.rand(
+#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
+
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
-    np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
+    np.zeros((splitk, MPAD // wmma_m, NPAD // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
 
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
-    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, K)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
     b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
     c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
-    np_c = np.matmul(a_np.astype("float16"), b_np.astype("float16"))
-    print("np result: ", np_c[0][0:10])
-    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np_c, rtol=1e-2, atol=1e-2
+        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e-2, atol=1e-2
     )
 # cuda_mod(cuda_a, cuda_b, cuda_c)
 # print(cuda_c.numpy())

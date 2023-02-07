@@ -4,6 +4,9 @@ import tvm.testing
 from tvm.script import tir as T
 import os
 from intrin.tricky_mma_float16_float16 import (
+    TRICKY_MMA_A_G2S_16x16_f16_INTRIN,
+    TRICKY_MMA_B_G2S_16x16_f16_INTRIN,
+    TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN,
     TRICKY_MMA_fill_16x16_f16_INTRIN,
     TRICKY_LDMATRIX_16x16_A_INTRIN,
     TRICKY_LDMATRIX_16x16_B_INTRIN,
@@ -41,7 +44,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = False
+VERIFY = True
 
 M = 16384
 N = 16384
@@ -193,13 +196,18 @@ def permutation_A(i, j, kernel_i, kernel_j):
     return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 # 128x32
-def permutation_B(i, j, kernel_i, kernel_j):
-    return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+# def permutation_B(i, j, kernel_i, kernel_j):
+#     return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
-sch.transform_layout(block_tricky_shared_A, ("read", 0),
-                     permutation_A)
-sch.transform_layout(block_tricky_shared_B, ("read", 0),
-                     permutation_B)
+# sch.transform_layout(block_tricky_shared_A, ("read", 0),
+#                      permutation_A)
+# sch.transform_layout(block_tricky_shared_B, ("read", 0),
+#                      permutation_B)
+sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
+block_tricky_shared_A = sch.get_block("A_g2s_shared")
+sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN)
+block_tricky_shared_B = sch.get_block("B_g2s_shared_trans")
+
 
 write_sch(sch, log_path, "tricky_shared_transform_layout")
 
@@ -332,40 +340,33 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.ones(
-    (M, K))).astype("float16")
-# a_np = np.arange(M * K).reshape(M // wmma_m, K //
-#                                 wmma_k, wmma_m, wmma_k).astype("float16")
-# a_np = (np.random.rand
-#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
-
-# b_np = (np.ones(
-#     (K // wmma_k, N // wmma_n,  wmma_k, wmma_n))).astype("float16")
-# b_np = np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n).astype("float16")
-
-b_np = np.mod(np.arange(N * K).reshape(N, K), 4).astype("float16")
-# print(b_np)
-# b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
+a_np = (np.random.rand(
+    M, K) * 4).astype("float16")
+b_np = (np.random.rand(
+    N, K) * 4).astype("float16")
 
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M, N)).astype("float16"), ctx)
 
-cuda_c = tvm.nd.array(
-    np.zeros((M, N)).astype("float16"), ctx)
-# cuda_mod(cuda_a, cuda_b, cuda_c)
-# print(cuda_c.asnumpy())
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
+    import torch
+    a_torch = torch.tensor(a_np, device="cuda")
+    b_torch = torch.tensor(b_np, device="cuda")
+    c_torch = torch.tensor(c_np, device="cuda")
+    torch.matmul(a_torch, b_torch.T, out=c_torch)
+    c_torch_np = c_torch.cpu().numpy()
+    print("torch result: ", c_torch_np[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e0, atol=1e0
+        c_np, c_torch_np, rtol=1e0, atol=1e0
     )
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

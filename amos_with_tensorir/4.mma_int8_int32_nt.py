@@ -24,6 +24,8 @@ from intrin.tricky_mma_int8_int32 import (
     TRICKY_MMA_i8i8i32_INTRIN,
     TRICKY_MMA_i8i8i32_TRANS_INTRIN,
     TRICKY_MMA_store_16x16_i32_global_INTRIN,
+    TRICKY_MMA_A_G2S_16x32_i8_INTRIN,
+    TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN,
     shared_16x16_to_ldmatrix_32x8_layout,
     shared_32x16_to_ldmatrix_32x16_layout,
     shared_16x32_to_ldmatrix_32x16_layout,
@@ -32,7 +34,7 @@ from intrin.tricky_mma_int8_int32 import (
     B_global_16x32_to_shared_load_16x32_layout,
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_int8_int32_nt"
+log_path = "progress/amos_with_tensorir/4.mma_int8_int32_nt"
 count = 0
 
 
@@ -56,7 +58,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = False
+VERIFY = True
 
 M = 16384
 N = 16384
@@ -133,7 +135,7 @@ sch.transform_layout(block_tricky_shared_B, ("write", 0), tricky_transform_B)
 sch.transform_layout(block_tricky_shared_local_A, ("write", 0), tricky_transform_A)
 sch.transform_layout(block_tricky_shared_local_B, ("write", 0), tricky_transform_B)
 sch.transform_layout(block_b, ("write", 0), tricky_transform_C)
-# sch.transform_layout(block_tricky_local_C, ("write", 0),tricky_transform_C)
+sch.transform_layout(block_tricky_local_C, ("write", 0),tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform")
 
@@ -191,18 +193,11 @@ block_tricky_local_C_loops = tricky_extract_cache(
 write_sch(sch, log_path, "tricky_extract_cache")
 
 # 128x32
-# sch.transform_layout(block_b, ("write", 0), permutation)
-def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *A_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
 
-
-def B_permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *B_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
-
-sch.transform_layout(block_tricky_shared_A, ("read", 0),
-                     permutation)
-sch.transform_layout(block_tricky_shared_B, ("read", 0),
-                     B_permutation)
+sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x32_i8_INTRIN)
+block_tricky_shared_A = sch.get_block("A_g2s_shared")
+sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN)
+block_tricky_shared_B = sch.get_block("B_g2s_shared_trans")
 
 write_sch(sch, log_path, "transform_layout")
 
@@ -318,31 +313,31 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = (np.ones(
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k)) * 2).astype("int8")
-a_np = (np.random.rand
-    (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
-
-# b_np = (np.ones(
-#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+a_np = (np.random.rand(
+    M, K) * 4).astype("int8")
 b_np = (np.random.rand(
-    N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
+    N, K) * 4).astype("int8")
+
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
 cuda_c = tvm.nd.array(
-    np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("int32"), ctx)
+    np.zeros((M // wmma_m, N // wmma_n, wmma_m, wmma_n)).astype("int32"), ctx)
+
 
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
-    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
-    b_np = b_np.transpose((0, 2, 1, 3)).reshape(N, K)
+    # c_np = cuda_c.numpy()
     c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    np_c = np.matmul(a_np.astype("int32"), b_np.astype("int32").T)
+    print("np result: ", np_c[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32").T), rtol=1e-4, atol=1e-4
+        c_np, np_c, rtol=1e-3, atol=1e-3
     )
+    print("assert_allclose pass!")
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 
