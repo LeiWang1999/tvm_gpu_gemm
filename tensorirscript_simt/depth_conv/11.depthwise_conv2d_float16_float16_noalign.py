@@ -12,10 +12,6 @@ import tvm
 from tvm import te
 import numpy as np
 import tvm.testing
-from tvm.script import tir as T
-from intrin.DP4A import DP4A_INTRIN
-
-
 
 # get file name and remove the suffix
 fname = os.path.basename(__file__)
@@ -63,7 +59,7 @@ dilation_h = 1
 dilation_w = 1
 factor = 1
 assert factor == 1, "we currently only support factor == 1"
-out_dtype = "int32"
+out_dtype = "float16"
 out_channels = in_channels * factor
 
 output_height = (height + 2 * pad_h - dilation_h *
@@ -105,7 +101,7 @@ wmma_k = 16
 
 # tuning params
 num_warps = 4
-chunk = 8
+chunk = 16
 
 warp_size = 32
 vec = 16
@@ -127,8 +123,8 @@ num_tx = K // vec if K // vec < warp_size else warp_size
 num_ty = warp_size // num_tx
 
 # Algorithm
-A = te.placeholder(data_shape, name="A", dtype="int8")
-W = te.placeholder(kernel_shape, name="W", dtype="int8")
+A = te.placeholder(data_shape, name="A", dtype="float16")
+W = te.placeholder(kernel_shape, name="W", dtype="float16")
 kh = te.reduce_axis((0, kernel_h), name="kh")
 kw = te.reduce_axis((0, kernel_w), name="kw")
 Apad = te.compute(
@@ -142,7 +138,7 @@ Apad = te.compute(
         tvm.tir.all(h >= pad_h, h - pad_h < height,
                     w >= pad_w, w - pad_w < width),
         A[i, n, h - pad_h, w - pad_w],
-        tvm.tir.const(0.0, "int8"),
+        tvm.tir.const(0.0, "float16"),
     ),
     name="Apad",
 )
@@ -164,7 +160,7 @@ A_Imp_Pad = te.compute(
     lambda x, y: tvm.tir.if_then_else(
         tvm.tir.all(y < K),
         A_Imp[x, y],
-        tvm.tir.const(0.0, "int8"),
+        tvm.tir.const(0.0, "float16"),
     ),
     name="data_im2col_pad",
 )
@@ -178,7 +174,7 @@ W_flat_Pad = te.compute(
     lambda x, y: tvm.tir.if_then_else(
         tvm.tir.all(y < K),
         W_flat[x, y],
-        tvm.tir.const(0.0, "int8"),
+        tvm.tir.const(0.0, "float16"),
     ),
     name="weight_flatten_pad",
 )
@@ -259,14 +255,14 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = np.ones(data_shape).astype("int8")
-# b_np = np.ones(kernel_shape).astype("int8")
+# a_np = np.ones(data_shape).astype("float16")
+# b_np = np.ones(kernel_shape).astype("float16")
 # random init a and b
-a_np = (np.random.uniform(size=data_shape) * 127).astype("int8")
-b_np = (np.random.uniform(size=kernel_shape) * 127).astype("int8")
+a_np = (np.random.uniform(size=data_shape) * 5).astype("float16")
+b_np = (np.random.uniform(size=kernel_shape) * 5).astype("float16")
 # aragnge init a and b
-# a_np = np.mod(np.arange(0, batch_size * in_channels * height * width), 4).reshape(data_shape).astype("int8")
-# b_np = np.mod(np.arange(0, kernel_h * kernel_w * in_channels * factor), 4).reshape(kernel_shape).astype("int8")
+# a_np = np.mod(np.arange(0, batch_size * in_channels * height * width), 4).reshape(data_shape).astype("float16")
+# b_np = np.mod(np.arange(0, kernel_h * kernel_w * in_channels * factor), 4).reshape(kernel_shape).astype("float16")
 
 c_np = np.zeros((M, N)).astype(out_dtype)
 cuda_a = tvm.nd.array(a_np, ctx)

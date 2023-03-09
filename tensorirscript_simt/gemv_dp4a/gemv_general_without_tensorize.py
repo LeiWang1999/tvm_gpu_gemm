@@ -60,10 +60,10 @@ num_warps = 4
 chunk = 8
 
 warp_size = 32
-vec = 16
+vec = 1
 MMA_M = 1
 MMA_N = 1
-MMA_K = 4
+MMA_K = 1
 
 if chunk * MMA_K < vec:
     vec = chunk * MMA_K
@@ -140,8 +140,8 @@ write_sch(sch, log_path, "schedule_local_B")
 
 sch.decompose_reduction(block_b, k)
 write_sch(sch, log_path, "decompose_reduction")
-sch.tensorize(kernel_k, DP4A_INTRIN)
-write_sch(sch, log_path, "do_tensorize")
+# sch.tensorize(kernel_k, DP4A_INTRIN)
+# write_sch(sch, log_path, "do_tensorize")
 
 
 ctx = tvm.cuda(0)

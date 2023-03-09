@@ -248,9 +248,9 @@ write_sch(sch, log_path, "schedule_local_B")
 sch.decompose_reduction(block_conv, k)
 sch.tensorize(kernel_k, DP4A_INTRIN)
 
-sch.unroll(vk)
-sch.unroll(sch.get_loops(block_shared_local_A)[-1])
-sch.unroll(sch.get_loops(block_shared_local_B)[-1])
+# sch.unroll(vk)
+# sch.unroll(sch.get_loops(block_shared_local_A)[-1])
+# sch.unroll(sch.get_loops(block_shared_local_B)[-1])
 
 
 ctx = tvm.cuda(0)
