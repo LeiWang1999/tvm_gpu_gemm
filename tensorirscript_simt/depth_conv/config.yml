@@ -1,0 +1,26 @@
+experimentName: tensorize_program_search_
+maxExperimentDuration: 1000h
+maxTrialNumber: 2000
+#choice: local, remote, pai
+searchSpaceFile: search_space.json
+#choice: true, false
+useAnnotation: false
+tuner:
+  #choice: TPE, Random, Anneal, Evolution, BatchTuner, MetisTuner, GPTuner
+  #SMAC (SMAC should be installed through nnictl)
+  # https://nni.readthedocs.io/zh/stable/hpo/tuners.html
+  name: GridSearch
+  # name: Evolution
+  # classArgs:
+    # optimize_mode: minimize
+    # population_size: 2048
+trialCommand: python3 4.tricky_mma_float16_float16_nn.py
+trialCodeDirectory: .
+trialGpuNumber: 4
+trialConcurrency: 32
+tunerGpuIndices: [0,1,2,3]
+trainingService:
+  platform: local
+  useActiveGpu: False
+  maxTrialNumberPerGpu: 13
+  gpuIndices: [0,1,2,3]
