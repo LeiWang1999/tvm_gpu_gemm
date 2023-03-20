@@ -1,0 +1,1 @@
+DEVICE_ID=3 BACKEND=c-cuda STEP=1000 COMPUTE_V1='- einstein_v2("output0[M / 16, N / 16, M % 16, N % 16] =. input0[M, N] where M in 5, N in 4096", input_dict={"input0": {"dtype": "float16", "shape": [5, 4096]}, "output0": {"dtype": "float16", "shape": [1, 256 ,16, 16]}})' antares save ./a_permutation.cu
