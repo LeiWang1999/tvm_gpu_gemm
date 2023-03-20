@@ -5,16 +5,15 @@
     thread_x will be set into 32, which represents the number of threads in a warp.
     thread_y and thread_z will be set into value which represents the array of warps. 
 """
+import tvm
+from tvm import te
+import numpy as np
+import tvm.testing
+from tvm.script import tir as T
+# from intrin.DP4A import DP4A_INTRIN
 import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from intrin.DP4A import DP4A_INTRIN
-from tvm.script import tir as T
-import tvm.testing
-import numpy as np
-from tvm import te
-import tvm
-
 
 
 # get file name and remove the suffix
@@ -108,15 +107,14 @@ num_warps = 4
 chunk = 8
 
 warp_size = 32
-vec = 1
+vec = 16
 
 MMA_M = 1
 MMA_N = 1
-MMA_K = 1
+MMA_K = 4
 
 # pad K to be multiple of MMA_K * 2
-# KPAD = K + (MMA_K * 2 - K % (MMA_K * 2)) % (MMA_K * 2)
-KPAD = K
+KPAD = K + (MMA_K * 2 - K % (MMA_K * 2)) % (MMA_K * 2)
 print("KPAD: ", KPAD)
 
 if chunk * MMA_K < vec:
@@ -125,7 +123,7 @@ if chunk * MMA_K < vec:
 vec_size = vec // MMA_K
 num_tx = K // vec if K // vec < warp_size else warp_size
 num_ty = warp_size // num_tx
-
+print("ty" + str(num_ty) + "tx" + str(num_tx))
 # Algorithm
 A = te.placeholder(data_shape, name="A", dtype="int8")
 W = te.placeholder(kernel_shape, name="W", dtype="int8")
@@ -175,7 +173,7 @@ W_flat = te.compute(
 )
 W_flat_Pad = te.compute(
     (N, KPAD),
-        lambda x, y: tvm.tir.if_then_else(
+    lambda x, y: tvm.tir.if_then_else(
         tvm.tir.all(y < K),
         W_flat[x, y],
         tvm.tir.const(0.0, "int8"),
@@ -220,12 +218,11 @@ write_sch(sch, log_path, "FlatInline")
 (i, j, k) = sch.get_loops(block_conv)
 bx, tz, i, ty = sch.split(
     i, factors=[None, num_warps, chunk, num_ty])
-# k, tx, vk, kernel_k = sch.split(k, factors=[None, num_tx, vec // MMA_K, MMA_K])
-tx = k
+k, tx, vk, kernel_k = sch.split(k, factors=[None, num_tx, vec // MMA_K, MMA_K])
 sch.bind(bx, "blockIdx.x")
 sch.bind(tz, "threadIdx.z")
 sch.bind(ty, "threadIdx.y")
-sch.bind(k, "threadIdx.x")
+sch.bind(tx, "threadIdx.x")
 write_sch(sch, log_path, "extract_compute")
 
 # cache read A from global memory to shared_memory
@@ -247,12 +244,12 @@ B_local_outer, B_local_vec = sch.split(B_local_fused, factors=[None, vec])
 sch.vectorize(B_local_vec)
 write_sch(sch, log_path, "schedule_local_B")
 
-sch.decompose_reduction(block_conv, k)
+# sch.decompose_reduction(block_conv, k)
 # sch.tensorize(kernel_k, DP4A_INTRIN)
 
 # sch.unroll(vk)
-sch.unroll(sch.get_loops(block_shared_local_A)[-1])
-sch.unroll(sch.get_loops(block_shared_local_B)[-1])
+# sch.unroll(sch.get_loops(block_shared_local_A)[-1])
+# sch.unroll(sch.get_loops(block_shared_local_B)[-1])
 
 
 ctx = tvm.cuda(0)
@@ -295,8 +292,8 @@ if VERIFY:
     # nhwc to cnhw
     c_torch_np = np.transpose(c_torch_np, (3, 0, 1, 2))
     c_torch_np = c_torch_np.reshape((M * N))
-    print("torch result: ", c_torch_np[0:10])
-    print("tvm result: ", cuda_c.asnumpy().reshape((M * N))[0:10])
+    print("torch result: ", c_torch_np[0:-10])
+    print("tvm result: ", cuda_c.asnumpy().reshape((M * N))[0:-10])
     # print("verify result: ", np.allclose(c_torch_np, cuda_c.asnumpy()))
 
 num_runs = 3

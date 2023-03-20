@@ -1,6 +1,6 @@
 """
 Problem definition:
-    1.We read a float16 matrix A of shape (M, K) from global memory to shared memory.
+    1.We read a int8 matrix A of shape (M, K) from global memory to shared memory.
     2.We need to do permutation on A to make it suitable for dp4a conflict free access.
     3.So we first need to read A from global memory to local memory.
     4.Then we need to do permutation on A in local memory.
@@ -27,7 +27,7 @@ import os
 fname = os.path.basename(__file__)
 fname = os.path.splitext(fname)[0]
 # create log path
-log_path = "progress/tensorirscript_simt/gemv_hfma2/" + fname
+log_path = "progress/tensorirscript_simt/" + fname
 count = 0
 
 
@@ -51,26 +51,26 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-M = 18966528
+M = 128
 N = 1
-K = 32
+K = 100352
 
 
 num_warps = 4
 chunk = 8
 
 warp_size = 32
-vec = 1
-MMA_M = 2
+vec = 16
+MMA_M = 1
 MMA_N = 1
-MMA_K = 1
+MMA_K = 4
 
 if chunk * MMA_K < vec:
     vec = chunk * MMA_K
 
 vec_size = vec // MMA_K
 num_tx = K // vec if K // vec < warp_size else warp_size
-num_ty = (warp_size - 1) // num_tx + 1
+num_ty = warp_size // num_tx
 
     
 print("num_tx = ", num_tx)
@@ -81,9 +81,9 @@ class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [M, K], dtype="float16")
-        B = T.match_buffer(b, [N, K], dtype="float16")
-        C = T.match_buffer(c, [M, N], dtype="float16")
+        A = T.match_buffer(a, [M, K], dtype="int8")
+        B = T.match_buffer(b, [N, K], dtype="int8")
+        C = T.match_buffer(c, [M, N], dtype="int32")
 
         for i, j, k in T.grid(M, N, K):
             with T.block("B"):
@@ -91,7 +91,7 @@ class MyModule:
                 with T.init():
                     C[vi, vj] = 0.0
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("float16") * B[vj, vk].astype("float16")
+                    A[vi, vk].astype("int32") * B[vj, vk].astype("int32")
 
 
 ir_module = MyModule
@@ -108,10 +108,10 @@ block_shared_local_B = sch.cache_read(block_b, 1, "local")
 block_local_C = sch.cache_write(block_b, 0, "local")
 write_sch(sch, log_path, "cache_related")
 
-bx, tz, i, kernel_i, ty = sch.split(
-    i, factors=[None, num_warps, chunk, MMA_M, num_ty])
-k, tx, vk, kernel_k = sch.split(k, factors=[None, num_tx, vec // MMA_K, MMA_K])
-sch.reorder(bx, i, tz, ty,  j,  k, tx, kernel_k)
+bx = i
+k, tz, i, ty, tx, vk, kernel_k = sch.split(
+    k, factors=[None, num_warps, chunk, num_ty, num_tx, vec // MMA_K, MMA_K])
+sch.reorder(bx, k, i, tz, ty,  j,  tx, vk, kernel_k)
 
 sch.bind(bx, "blockIdx.x")
 sch.bind(tz, "threadIdx.z")
@@ -124,7 +124,7 @@ sch.compute_at(block_shared_local_A, tx, preserve_unit_loops=True)
 # sch.compute_at(block_shared_A, i, preserve_unit_loops=True)
 sch.compute_at(block_shared_local_B, tx, preserve_unit_loops=True)
 # sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
-sch.reverse_compute_at(block_local_C, ty, preserve_unit_loops=True)
+sch.reverse_compute_at(block_local_C, bx, preserve_unit_loops=True)
 write_sch(sch, log_path, "compute_at_related")
 
 # # 128x32
@@ -138,12 +138,10 @@ B_local_outer, B_local_vec = sch.split(B_local_fused, factors=[None, vec])
 sch.vectorize(B_local_vec)
 write_sch(sch, log_path, "schedule_local_B")
 
-sch.vectorize(kernel_i)
-write_sch(sch, log_path, "do_tensorize")
-
-sch.decompose_reduction(block_b, k)
+# sch.decompose_reduction(block_b, k)
 write_sch(sch, log_path, "decompose_reduction")
 # sch.tensorize(kernel_k, DP4A_INTRIN)
+write_sch(sch, log_path, "do_tensorize")
 
 
 ctx = tvm.cuda(0)
@@ -151,9 +149,9 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(K * N).reshape((N, K)).astype("float16"), ctx)
-cuda_c = tvm.nd.array(np.zeros((M, N)).astype("float16"), ctx)
+cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
+cuda_b = tvm.nd.array(np.arange(K * N).reshape((N, K)).astype("int8"), ctx)
+cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N

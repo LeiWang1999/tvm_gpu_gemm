@@ -124,7 +124,7 @@ if chunk * MMA_K < vec:
 vec_size = vec // MMA_K
 num_tx = K // vec if K // vec < warp_size else warp_size
 num_ty = warp_size // num_tx
-
+print("ty" + str(num_ty) + "tx" + str(num_tx))
 # Algorithm
 A = te.placeholder(data_shape, name="A", dtype="int8")
 W = te.placeholder(kernel_shape, name="W", dtype="int8")
@@ -293,8 +293,8 @@ if VERIFY:
     # nhwc to cnhw
     c_torch_np = np.transpose(c_torch_np, (3, 0, 1, 2))
     c_torch_np = c_torch_np.reshape((M * N))
-    print("torch result: ", c_torch_np[0:10])
-    print("tvm result: ", cuda_c.asnumpy().reshape((M * N))[0:10])
+    print("torch result: ", c_torch_np[0:-10])
+    print("tvm result: ", cuda_c.asnumpy().reshape((M * N))[0:-10])
     # print("verify result: ", np.allclose(c_torch_np, cuda_c.asnumpy()))
 
 num_runs = 3

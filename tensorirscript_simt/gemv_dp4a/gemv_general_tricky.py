@@ -50,31 +50,48 @@ def write_sch(sch, path, fname):
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
 
-M = 4
-N = 1
-K = 4
 
+M = 18966528
+N = 1
+K = 32
+
+
+num_warps = 4
+chunk = 8
+
+warp_size = 32
+vec = 16
 MMA_M = 1
 MMA_N = 1
 MMA_K = 4
 
+if chunk * MMA_K < vec:
+    vec = chunk * MMA_K
+
+vec_size = vec // MMA_K
+num_tx = K // vec if K // vec < warp_size else warp_size
+num_ty = warp_size // num_tx
+
+    
+print("num_tx = ", num_tx)
+print("num_ty = ", num_ty)
 
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [N, K], dtype="int8")
+        A = T.match_buffer(a, [M, K // MMA_K, MMA_K], dtype="int8")
+        B = T.match_buffer(b, [N, K // MMA_K, MMA_K], dtype="int8")
         C = T.match_buffer(c, [M, N], dtype="int32")
 
-        for i, j, k in T.grid(M, N, K):
+        for i, j, k, kk in T.grid(M, N, K // MMA_K, MMA_K):
             with T.block("B"):
-                vi, vj, vk = T.axis.remap("SSR", [i, j, k])
+                vi, vj, vk, vkk = T.axis.remap("SSRR", [i, j, k, kk])
                 with T.init():
                     C[vi, vj] = 0.0
                 C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("int32") * B[vj, vk].astype("int32")
+                    A[vi, vk, vkk].astype("int32") * B[vj, vk, vkk].astype("int32")
 
 
 ir_module = MyModule
@@ -83,32 +100,46 @@ sch = tvm.tir.Schedule(ir_module, debug_mask="all")
 print(ir_module.script())
 
 block_b = sch.get_block("B")
-i, j, k = sch.get_loops(block_b)
-block_shared_A = sch.cache_read(block_b, 0, "shared")
+i, j, k, kernel_k = sch.get_loops(block_b)
+# block_shared_A = sch.cache_read(block_b, 0, "shared")
 block_shared_local_A = sch.cache_read(block_b, 0, "local")
-block_shared_B = sch.cache_read(block_b, 1, "shared")
+# block_shared_B = sch.cache_read(block_b, 1, "shared")
 block_shared_local_B = sch.cache_read(block_b, 1, "local")
 block_local_C = sch.cache_write(block_b, 0, "local")
 write_sch(sch, log_path, "cache_related")
 
-i, kernel_i = sch.split(i, factors=[None, MMA_M])
-j, kernel_j = sch.split(j, factors=[None, MMA_N])
-k, kernel_k = sch.split(k, factors=[None, MMA_K])
-sch.reorder(i, j, k, kernel_i, kernel_j, kernel_k)
-sch.bind(i, "blockIdx.x")
-sch.bind(j, "threadIdx.x")
+bx, tz, i, ty = sch.split(
+    i, factors=[None, num_warps, chunk, num_ty])
+k, tx, vk = sch.split(k, factors=[None, num_tx, vec // MMA_K])
+sch.reorder(bx, i, tz, ty,  j,  k, tx, vk, kernel_k)
+
+sch.bind(bx, "blockIdx.x")
+sch.bind(tz, "threadIdx.z")
+sch.bind(ty, "threadIdx.y")
+sch.bind(tx, "threadIdx.x")
 write_sch(sch, log_path, "do_split")
 
 # cache read A from global memory to shared_memory
-sch.compute_at(block_shared_local_A, k)
-sch.compute_at(block_shared_A, k)
-sch.compute_at(block_shared_local_B, k)
-sch.compute_at(block_shared_B, k)
-sch.reverse_compute_at(block_local_C, j)
+sch.compute_at(block_shared_local_A, tx, preserve_unit_loops=True)
+# sch.compute_at(block_shared_A, i, preserve_unit_loops=True)
+sch.compute_at(block_shared_local_B, tx, preserve_unit_loops=True)
+# sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
+sch.reverse_compute_at(block_local_C, ty, preserve_unit_loops=True)
+write_sch(sch, log_path, "compute_at_related")
+
+# # 128x32
+A_local_fused = sch.fuse(*sch.get_loops(block_shared_local_A)[-2:])
+A_local_outer, A_local_vec = sch.split(A_local_fused, factors=[None, vec])
+sch.vectorize(A_local_vec)
+write_sch(sch, log_path, "schedule_local_A")
+
+B_local_fused = sch.fuse(*sch.get_loops(block_shared_local_B)[-2:])
+B_local_outer, B_local_vec = sch.split(B_local_fused, factors=[None, vec])
+sch.vectorize(B_local_vec)
+write_sch(sch, log_path, "schedule_local_B")
 
 sch.decompose_reduction(block_b, k)
 write_sch(sch, log_path, "decompose_reduction")
-
 sch.tensorize(kernel_k, DP4A_INTRIN)
 write_sch(sch, log_path, "do_tensorize")
 
@@ -118,8 +149,8 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
-cuda_b = tvm.nd.array(np.arange(K * N).reshape((N, K)).astype("int8"), ctx)
+cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K // MMA_K, MMA_K)).astype("int8"), ctx)
+cuda_b = tvm.nd.array(np.arange(K * N).reshape((N, K // MMA_K, MMA_K)).astype("int8"), ctx)
 cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
 
