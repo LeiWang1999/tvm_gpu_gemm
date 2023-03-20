@@ -12,7 +12,11 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_F16_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorirscript_imma/1.tricky_wmma_float16_float16_nt"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -35,9 +39,18 @@ def write_sch(sch, path, fname):
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
 
+
+VERIFY = True
+
 M = 16384
 N = 16384
 K = 16384
+if VERIFY:
+    M = 256
+    N = 4096
+    K = 1024
+    
+    
 warp_size = 32
 block_row_warps = 2
 block_col_warps = 4
@@ -104,9 +117,9 @@ write_sch(sch, log_path, "thread_bind")
 
 # cache read A from global memory to shared_memory
 sch.compute_at(block_shared_local_A, ki)
-sch.compute_at(block_shared_A, ko)
+sch.compute_at(block_shared_A, ko, preserve_unit_loops=True)
 sch.compute_at(block_shared_local_B, ki)
-sch.compute_at(block_shared_B, ko)
+sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
 sch.reverse_compute_at(block_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
@@ -174,14 +187,36 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16"), ctx)
+# cuda_a = tvm.nd.array(np.arange(M * K).reshape((M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16"), ctx)
+# cuda_b = tvm.nd.array(np.arange(N * K).reshape((N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16"), ctx)
+a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K //
+              wmma_k, wmma_m, wmma_k), 4).astype("float16")
+b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K //
+              wmma_k, wmma_n, wmma_k), 5).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
     np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
-cuda_mod(cuda_a, cuda_b, cuda_c)
-
+if VERIFY:
+    cuda_mod(cuda_a, cuda_b, cuda_c)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, K)
+    b_np = b_np.transpose((0, 2, 1, 3)).reshape(N, K)
+    c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    import torch
+    a_torch = torch.tensor(a_np, device="cuda")
+    b_torch = torch.tensor(b_np, device="cuda")
+    c_torch = torch.tensor(c_np, device="cuda")
+    torch.matmul(a_torch, b_torch.T, out=c_torch)
+    c_torch_np = c_torch.cpu().numpy()
+    print("torch result: ", c_torch_np[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
+    np.testing.assert_allclose(
+        c_np, c_torch_np, rtol=1e-1, atol=1e-1
+    )
+    print("assert_allclose pass !")
+    
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

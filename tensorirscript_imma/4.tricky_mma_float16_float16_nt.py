@@ -1,42 +1,9 @@
-"""
-    Improving the Performance of Matrix Multiplication on GPUs with TensorIR
-    What we need to do to optimized the code that we generated in this code?
-    change     
-    __asm__ __volatile__(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
-      "{%0, %1, %2, %3}, [%4];\n"
-      : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
-      : "r"(addr)
-    );
-    into 
-    __asm__ __volatile__(
-    "ldmatrix.sync.aligned.m8n8.x4.shared.b16"
-    "{%0, %1, %2, %3}, [%4];\n"
-    : "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[0]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[2]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[1]), "=r"(((unsigned *)(B_shared_warp + (ax0_1 * 8)))[3])
-    : "r"(addr)
-    );
-    
-    hands on vectorize the global store stage.
-    for (int ax0_2 = 0; ax0_2 < 2; ++ax0_2) {
-    for (int ax1_0 = 0; ax1_0 < 2; ++ax1_0) {
-      for (int ax1_1 = 0; ax1_1 < 2; ++ax1_1) {
-        for (int local_id = 0; local_id < 8; ++local_id) {
-(&(C[(((((((((int)blockIdx.x) * 1048576) + (((int)threadIdx.y) * 524288)) + (ax0_2 * 262144)) + (((int)blockIdx.y) * 4096)) + (((int)threadIdx.z) * 1024)) + (ax1_0 * 512)) + (ax1_1 * 256))]))[((((((local_id % 4) / 2) * 8) + (threadIdx.x / 4)) * 16) + ((((local_id / 4) * 8) + ((threadIdx.x % 4) * 2)) + (local_id % 2)))] = C_warp[(((ax0_2 * 32) + (ax1_0 * 16)) + (ax1_1 * 8)) + local_id];
-}
-;
-      }
-    }
-  }
-"""
 import tvm
 import numpy as np
 import tvm.testing
 from tvm.script import tir as T
 import os
 from intrin.tricky_mma_float16_float16 import (
-    TRICKY_MMA_A_G2S_16x16_f16_INTRIN,
-    TRICKY_MMA_B_G2S_16x16_f16_INTRIN,
-    TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN,
     TRICKY_MMA_fill_16x16_f16_INTRIN,
     TRICKY_LDMATRIX_16x16_A_INTRIN,
     TRICKY_LDMATRIX_16x16_B_INTRIN,
@@ -50,7 +17,11 @@ from intrin.tricky_mma_float16_float16 import (
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nt"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -159,10 +130,16 @@ write_sch(sch, log_path, "cache_read_compute_at")
 
 
 # 128x32
-sch.tensorize(sch.get_loops(block_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
-block_shared_A = sch.get_block("A_g2s_shared")
-sch.tensorize(sch.get_loops(block_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN)
-block_shared_B = sch.get_block("B_g2s_shared_trans")
+def A_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+
+def B_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+
+sch.transform_layout(block_shared_A, ("read", 0),
+                     A_permutation)
+sch.transform_layout(block_shared_B, ("read", 0),
+                     B_permutation)
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
@@ -223,10 +200,6 @@ sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_f16_globa
 write_sch(sch, log_path,
            "tensorize")
 
-# c_warp_o = sch.get_block("C_warp_o")
-# print(sch.get_loops(c_warp_o)[-1])
-# _, vec = sch.split(sch.get_loops(c_warp_o)[-1], factors=[None, 2])
-# sch.vectorize(vec)
 
 # unroll
 # sch.unroll(init_block_b_i)

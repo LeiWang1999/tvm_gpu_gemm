@@ -34,7 +34,11 @@ from tvm.tir.tensor_intrin.cuda import (
 )
 
 
-log_path = "progress/tensorirscript_imma/6.padding_mma_f16_nn"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 def write_code(code, path, fname):
     global count
@@ -275,7 +279,7 @@ if VERIFY:
     )
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

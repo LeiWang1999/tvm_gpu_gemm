@@ -12,7 +12,11 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorirscript_imma/0.tricky_wmma_int8_int32"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -35,20 +39,21 @@ def write_sch(sch, path, fname):
     cu_fname = fname + ".cu"
     write_code(sch.mod.astext(), path, cu_fname)
 
+
 M = 16384
 N = 16384
 K = 16384
 warp_size = 32
-block_row_warps = 2
-block_col_warps = 2
-warp_row_tiles = 2
-warp_col_tiles = 8
-chunk = 2
+block_row_warps = 4
+block_col_warps = 1
+warp_row_tiles = 4
+warp_col_tiles = 4
+chunk = 4
 vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-
+split_k = 32
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
@@ -88,11 +93,15 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
+if split_k > 0:
+    block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
-sch.bind(block_i, "blockIdx.x")
-sch.bind(block_j, "blockIdx.y")
+if split_k > 0:
+    sch.bind(block_k, "blockIdx.z")
+sch.bind(block_i, "blockIdx.y")
+sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
 
@@ -101,9 +110,9 @@ write_sch(sch, log_path, "thread_bind")
 
 # cache read A from global memory to shared_memory
 sch.compute_at(block_shared_local_A, ki)
-sch.compute_at(block_shared_A, ko)
+sch.compute_at(block_shared_A, ko, preserve_unit_loops=True)
 sch.compute_at(block_shared_local_B, ki)
-sch.compute_at(block_shared_B, ko)
+sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
 sch.reverse_compute_at(block_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
@@ -161,7 +170,7 @@ cuda_c = tvm.nd.array(np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astyp
 cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

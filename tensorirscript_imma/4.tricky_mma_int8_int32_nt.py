@@ -17,8 +17,6 @@ import tvm.testing
 from tvm.script import tir as T
 import os
 from intrin.tricky_mma_int8_int32 import (
-    TRICKY_MMA_A_G2S_16x32_i8_INTRIN,
-    TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN,
     TRICKY_MMA_fill_16x16_i32_INTRIN,
     TRICKY_LDMATRIX_16x32_A_INTRIN,
     TRICKY_LDMATRIX_32x16_B_INTRIN,
@@ -34,7 +32,11 @@ from intrin.tricky_mma_int8_int32 import (
     B_global_16x32_to_shared_load_16x32_layout,
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_int8_int32_nt_tensorize"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -58,7 +60,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -69,12 +71,12 @@ if VERIFY:
     K = 1024
 
 warp_size = 32
-block_row_warps = 4
-block_col_warps = 1
-warp_row_tiles = 4
-warp_col_tiles = 4
+block_row_warps = 1
+block_col_warps = 4
+warp_row_tiles = 8
+warp_col_tiles = 2
 chunk = 2
-splitk = 16
+splitk = 8
 vec = 16
 wmma_m = 16
 wmma_n = 16
@@ -150,16 +152,12 @@ def permutation(i, j, kernel_i, kernel_j):
 def B_permutation(i, j, kernel_i, kernel_j):
     return (i, j, *B_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
 
-# sch.transform_layout(block_shared_A, ("read", 0),
-#                      permutation)
-# sch.transform_layout(block_shared_B, ("read", 0),
-#                      B_permutation)
+sch.transform_layout(block_shared_A, ("read", 0),
+                     permutation)
+sch.transform_layout(block_shared_B, ("read", 0),
+                     B_permutation)
 
 
-sch.tensorize(sch.get_loops(block_shared_A)[-2], TRICKY_MMA_A_G2S_16x32_i8_INTRIN)
-block_shared_A = sch.get_block("A_g2s_shared")
-sch.tensorize(sch.get_loops(block_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN)
-block_shared_B = sch.get_block("B_g2s_shared_trans")
 
 write_sch(sch, log_path, "transform_layout")
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
@@ -226,33 +224,29 @@ write_sch(sch, log_path,
            "tensorize")
 
 # unroll
-# sch.unroll(init_block_b_i)
-# sch.unroll(init_block_b_j)
-# sch.unroll(block_shared_local_A_i)
-# sch.unroll(block_shared_local_A_j)
-# sch.unroll(block_shared_local_B_i)
-# sch.unroll(block_shared_local_B_j)
-# sch.unroll(ii)
-# sch.unroll(jj)
-# sch.unroll(A_shared_inner)
-# sch.unroll(B_shared_inner)
-
 
 write_sch(sch, log_path,
            "do_unroll")
 
 
 ctx = tvm.cuda(0)
-cuda_mod = tvm.build(sch.mod, target="cuda")
-
+with tvm.transform.PassContext(config={"tir.ptx_ldg128_sts128": False}):
+    cuda_mod = tvm.build(sch.mod, target="cuda")
+    
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 
-a_np = (np.random.rand
-    (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 4).astype("int8")
+a_np = (np.ones
+        ((M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
 
-b_np = (np.random.rand(
-    N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 4).astype("int8")
+b_np = (np.ones(
+    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+
+# a_np = (np.random.rand
+#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 4).astype("int8")
+
+# b_np = (np.random.rand(
+#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 4).astype("int8")
 # a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("int8")
 # b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("int8")
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)

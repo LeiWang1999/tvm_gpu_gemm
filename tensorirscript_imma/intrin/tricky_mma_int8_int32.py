@@ -43,6 +43,12 @@ def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
     return (i // 8) * 16 + (j // 8) * 8 + i % 8, j % 8
 
 
+def shared_load_16x32_to_A_global_16x32_layout(row, col):
+    thread_id = row + (col // 16) * 16
+    i = thread_id // 2
+    j = (col % 16) + (thread_id % 2) * 16
+    return i, j
+
 def A_global_16x32_to_shared_load_16x32_layout(i, j):
     # 0, 0-16 -> 0, 0-16
     # 1, 0-16 -> 1, 0-16
@@ -436,7 +442,7 @@ def get_mma_store_intrin(dtype, local_size, scope="global"):
             a, [WARP_SIZE, local_size], dtype=dtype, scope="warp", offset_factor=1
         )
         C = T.match_buffer(
-            c, [M_DIM, N_DIM], dtype=dtype, scope="global", offset_factor=1, strides=[s0, s1]
+            c, [M_DIM, N_DIM], dtype=dtype, scope=scope, offset_factor=1, strides=[s0, s1]
         )
 
         with T.block("root"):
@@ -475,6 +481,18 @@ TensorIntrin.register(TRICKY_LDMATRIX_32x16_B_INTRIN, *
 TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN = "TRICKY_mma.ldmatrix_16x32_b_trans"
 TensorIntrin.register(TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN, *
                       get_ldmatrix_intrin(32, "int8", True, True))
+
+TRICKY_LDMATRIX_16x32_A_DYN_INTRIN = "TRICKY_mma.ldmatrix_16x32_a_DYN"
+TensorIntrin.register(TRICKY_LDMATRIX_16x32_A_DYN_INTRIN, *
+                      get_ldmatrix_intrin(32, "int8", False, False, "shared.dyn"))
+
+TRICKY_LDMATRIX_32x16_B_DYN_INTRIN = "TRICKY_mma.ldmatrix_32x16_b_DYN"
+TensorIntrin.register(TRICKY_LDMATRIX_32x16_B_DYN_INTRIN, *
+                      get_ldmatrix_intrin(32, "int8", True, False, "shared.dyn"))
+
+TRICKY_LDMATRIX_16x32_B_DYN_TRANS_INTRIN = "TRICKY_mma.ldmatrix_16x32_b_trans_DYN"
+TensorIntrin.register(TRICKY_LDMATRIX_16x32_B_DYN_TRANS_INTRIN, *
+                      get_ldmatrix_intrin(32, "int8", True, True, "shared.dyn"))
 
 TRICKY_MMA_i8i8i32_INTRIN = "TRICKY_mma_i8i8i32"
 TensorIntrin.register(TRICKY_MMA_i8i8i32_INTRIN, *

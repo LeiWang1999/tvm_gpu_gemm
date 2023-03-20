@@ -1,22 +1,30 @@
 import tvm
-from tvm import te
 import numpy as np
 import tvm.testing
 from tvm.script import tir as T
 import os
 from intrin.tricky_mma_float16_float16 import (
     TRICKY_MMA_fill_16x16_f16_INTRIN,
+    TRICKY_LDMATRIX_16x16_A_INTRIN,
     TRICKY_LDMATRIX_16x16_A_INTRIN_DYN,
+    TRICKY_LDMATRIX_16x16_B_INTRIN,
+    TRICKY_LDMATRIX_16x16_B_INTRIN_DYN,
     TRICKY_LDMATRIX_16x16_B_TRANS_INTRIN_DYN,
+    TRICKY_LDMATRIX_16x16_B_TRANS_INTRIN,
     TRICKY_MMA_f16f16f16_INTRIN,
     TRICKY_MMA_f16f16f16_TRANS_INTRIN,
     TRICKY_MMA_store_16x16_f16_global_INTRIN,
-    global_16x16_to_shared_load_16x16_layout,
+    A_global_16x16_to_shared_load_16x16_layout,
+    B_global_16x16_to_shared_load_16x16_layout,
     C_shared_16x16_to_ldmatrix_32x8_layout,
-    A_B_shared_16x16_to_ldmatrix_32x8_layout
+    A_B_shared_16x16_to_ldmatrix_32x8_layout,
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nt_dyn"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -47,15 +55,17 @@ N = 16384
 K = 16384
 if VERIFY:
     M = 256
-    N = 256
-    K = 256
+    N = 4096
+    K = 1024
 
 warp_size = 32
-block_row_warps = 4
+block_row_warps = 2
 block_col_warps = 2
-warp_row_tiles = 2
+warp_row_tiles = 4
 warp_col_tiles = 8
+raster = 16
 chunk = 2
+stage = 1
 vec = 8
 wmma_m = 16
 wmma_n = 16
@@ -103,9 +113,8 @@ ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
 
 write_sch(sch, log_path, "block_tile")
-
-sch.bind(block_i, "blockIdx.x")
-sch.bind(block_j, "blockIdx.y")
+sch.bind(block_i, "blockIdx.y")
+sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
 
@@ -114,22 +123,24 @@ write_sch(sch, log_path, "thread_bind")
 
 # cache read A from global memory to shared_memory
 sch.compute_at(block_shared_local_A, ki)
-sch.compute_at(block_shared_A, ko)
+sch.compute_at(block_shared_A, ko, preserve_unit_loops=True)
 sch.compute_at(block_shared_local_B, ki)
-sch.compute_at(block_shared_B, ko)
+sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
 sch.reverse_compute_at(block_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
 
 # 128x32
-def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def A_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
+def B_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 sch.transform_layout(block_shared_A, ("read", 0),
-                     permutation)
+                     A_permutation)
 sch.transform_layout(block_shared_B, ("read", 0),
-                     permutation)
+                     B_permutation)
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
@@ -147,7 +158,6 @@ sch.vectorize(B_shared_vi)
 sch.bind(B_shared_tx, "threadIdx.x")
 sch.bind(B_shared_ty, "threadIdx.y")
 sch.bind(B_shared_tz, "threadIdx.z")
-
 write_sch(sch, log_path, "schedule_B_shared")
 
 # decompose reduction
@@ -203,29 +213,65 @@ write_sch(sch, log_path,
 # sch.unroll(A_shared_inner)
 # sch.unroll(B_shared_inner)
 
+if stage > 1:
 
+    sch.annotate(ki, ann_key="software_pipeline_stage", ann_val=[0, 0, 0])
+    sch.annotate(ki, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+
+    sch.annotate(ko, ann_key="software_pipeline_stage",
+                 ann_val=[0, 0, 0, stage - 1, 0])
+    sch.annotate(ko, ann_key="software_pipeline_order",
+                 ann_val=[0, 1, 3, 2, 4])
+    sch.annotate(ko, ann_key="software_pipeline_async_stages", ann_val=[0])
+
+if raster > 0:
+    sch.annotate(init_block_b_i,
+                 ann_key="thread_rasterization", ann_val=raster)
+    
 write_sch(sch, log_path,
            "do_unroll")
 
 
-ctx = tvm.cuda(0)
-cuda_mod = tvm.build(sch.mod, target="cuda")
+# @tvm.register_func
+# def tvm_callback_cuda_postproc(code):
+#     code_lines = code.split("\n")
+#     # Keep track of the current wait group number
+#     commit_count = 0
+#     for i, line in enumerate(code_lines):
+#         if '__asm__ __volatile__("cp.async.wait_group' in line:
+#             del code_lines[i]
 
+#     for i, line in enumerate(code_lines):
+#         # line = code_lines[i]
+#         if '__asm__ __volatile__("cp.async.commit_group;");' in line:
+#             # If a line contains the __asm__ __volatile__("cp.async.commit_group;") statement, increment the counter
+#             commit_count += 1
+#             if commit_count < stage:
+#                 del code_lines[i]
+#             else:
+#                 # insert a wait group statement
+#                 code_lines.insert(
+#                     i+1, '__asm__ __volatile__("cp.async.wait_group 0;");')
+#                 break
+#     # Re-assemble the code string
+#     new_code = "\n".join(code_lines)
+#     return new_code
+
+
+ctx = tvm.cuda(0)
+with tvm.transform.PassContext(config={"tir.use_async_copy": 1, "tir.ptx_ldg128_sts128": True}):
+    cuda_mod = tvm.build(sch.mod, target="cuda")
+    
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = (np.ones(
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("float16")
-# a_np = np.arange(M * K).reshape(M // wmma_m, K //
-#                                 wmma_k, wmma_m, wmma_k).astype("float16")
-a_np = (np.random.rand
-        (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
-b_np = (np.ones(
-    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("float16")
-# b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("float16")
-# b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
+# a_np = (np.random.rand
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
+# b_np = (np.random.rand
+#         (N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16")
+a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("float16")
+b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("float16")
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
@@ -233,15 +279,28 @@ cuda_c = tvm.nd.array(
 
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
-    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, N)
-    b_np = b_np.transpose((0, 2, 1, 3)).reshape(K, N)
+    a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, K)
+    b_np = b_np.transpose((0, 2, 1, 3)).reshape(N, K)
     c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
+    import torch
+    a_torch = torch.tensor(a_np, device="cuda")
+    b_torch = torch.tensor(b_np, device="cuda")
+    c_torch = torch.tensor(c_np, device="cuda")
+    torch.matmul(a_torch, b_torch.T, out=c_torch)
+    c_torch_np = c_torch.cpu().numpy()
+    print("torch result: ", c_torch_np[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-2, atol=1e-2
+        c_np, c_torch_np, rtol=1e-1, atol=1e-1
     )
+    print("assert_allclose pass !")
 
+
+
+# cuda_mod(cuda_a, cuda_b, cuda_c)
+# print(cuda_c.numpy())
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

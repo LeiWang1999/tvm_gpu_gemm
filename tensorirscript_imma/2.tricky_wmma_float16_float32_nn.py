@@ -12,7 +12,7 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_F32_GLOBAL_INTRIN,
 )
 
-log_path = "progress/tensorscript_imma/2.tricky_wmma_float16_float32_nn"
+log_path = "progress/tensorirscript_imma/2.tricky_wmma_float16_float32_nn"
 count = 0
 def write_code(code, path, fname):
     global count
@@ -34,15 +34,16 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
-M = 16384
-N = 16384
-K = 16384
+M = 43008
+N = 1024
+K = 14336
 if VERIFY:
     M = 256
     N = 256
     K = 256
+
 warp_size = 32
 block_row_warps = 4
 block_col_warps = 2
@@ -108,9 +109,9 @@ write_sch(sch, log_path, "thread_bind")
 
 # cache read A from global memory to shared_memory
 sch.compute_at(block_shared_local_A, ki)
-sch.compute_at(block_shared_A, ko)
+sch.compute_at(block_shared_A, ko, preserve_unit_loops=True)
 sch.compute_at(block_shared_local_B, ki)
-sch.compute_at(block_shared_B, ko)
+sch.compute_at(block_shared_B, ko, preserve_unit_loops=True)
 sch.reverse_compute_at(block_local_C, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
@@ -181,7 +182,7 @@ if VERIFY:
     )
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

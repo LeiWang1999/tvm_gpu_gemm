@@ -34,7 +34,11 @@ from tvm.tir.tensor_intrin.cuda import (
 )
 
 
-log_path = "progress/tensorirscript_imma/5.padding_mma_i32_nt"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 def write_code(code, path, fname):
     global count
@@ -55,7 +59,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -266,12 +270,16 @@ cuda_c = tvm.nd.array(
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
+    np_c = np.matmul(a_np.astype("int32"), b_np.astype("int32").T)
+    print("np result: ", np_c[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32").T), rtol=1e-1, atol=1e-1
+        c_np, np_c, rtol=1e-3, atol=1e-3
     )
+    print("assert_allclose pass!")
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

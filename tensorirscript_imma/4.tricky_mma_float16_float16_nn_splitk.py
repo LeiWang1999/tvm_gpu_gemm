@@ -46,7 +46,11 @@ from intrin.tricky_mma_float16_float16 import (
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-log_path = "progress/tensorirscript_imma/4.tricky_mma_float16_float16_nn"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 
 
@@ -72,9 +76,9 @@ def write_sch(sch, path, fname):
 
 VERIFY = False
 
-M = 3136
-N = 64
-K = 576
+M = 16
+N = 1024
+K = 4096
 if VERIFY:
     M = 256
     N = 2048
@@ -82,18 +86,18 @@ if VERIFY:
 
 warp_size = 32
 # nni search results:
-block_row_warps = 2
-block_col_warps = 2
-warp_row_tiles = 2
-warp_col_tiles = 2
-chunk = 2
+block_row_warps = 1
+block_col_warps = 1
+warp_row_tiles = 1
+warp_col_tiles = 1
+chunk = 1
 vec = 8
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
 stage = 1 # 1 is no double buffer 2 is double buffer enabled
 raster = 16
-splitk = 1
+splitk = 2
 
 # padding MPAD as the multiple of block_row_warps * warp_row_tiles * wmma_m
 MPAD = (M + block_row_warps * warp_row_tiles * wmma_m - 1) // (
@@ -108,23 +112,24 @@ KPAD = (K + block_col_warps * warp_col_tiles * wmma_k * splitk - 1) // (
     block_col_warps * warp_col_tiles * wmma_k * splitk
 ) * block_col_warps * warp_col_tiles * wmma_k * splitk
 
+reduce_k = KPAD // splitk
 
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [MPAD // wmma_m, KPAD // (wmma_k * splitk), wmma_m, wmma_k], dtype="float16")
-        B = T.match_buffer(b, [KPAD // (wmma_k * splitk), NPAD // wmma_n, wmma_k, wmma_n], dtype="float16")
+        A = T.match_buffer(a, [MPAD // wmma_m, KPAD // wmma_k, wmma_m, wmma_k], dtype="float16")
+        B = T.match_buffer(b, [KPAD // wmma_k, NPAD // wmma_n, wmma_k, wmma_n], dtype="float16")
         C = T.match_buffer(c, [splitk, MPAD // wmma_m, NPAD // wmma_n, wmma_m, wmma_n], dtype="float16")
 
-        for sk, ii, jj, kk, i, j, k  in T.grid(splitk, MPAD // wmma_m, NPAD // wmma_n, KPAD // (wmma_k * splitk), wmma_m, wmma_n, wmma_k):
+        for sk, ii, jj, kk, i, j, k  in T.grid(splitk, MPAD // wmma_m, NPAD // wmma_n, reduce_k // wmma_k, wmma_m, wmma_n, wmma_k):
             with T.block("B"):
                 vsk, vii, vjj, vkk, vi, vj, vk = T.axis.remap("SSSRSSR", [sk, ii, jj, kk, i, j, k])
                 with T.init():
                     C[vsk, vii, vjj, vi, vj] = 0.0
                 C[vsk, vii, vjj, vi, vj] = C[vsk, vii, vjj, vi, vj] + \
-                    A[vii, vkk, vi, vk] * B[vkk, vjj, vk, vj]
+                    A[vii,  vsk * (reduce_k // wmma_k) + vkk, vi, vk] * B[vsk * (reduce_k // wmma_k) + vkk, vjj, vk, vj]
 
 
 ir_module = MyModule
