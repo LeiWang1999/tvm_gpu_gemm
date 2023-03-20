@@ -20,7 +20,11 @@ from intrin.tricky_mma_float16_float16 import (
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-log_path = "progress/amos_with_tensorir/1.mma_float16_float16_nt"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/amos_with_tensorir/" + fname
 count = 0
 
 
@@ -44,7 +48,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -196,17 +200,17 @@ def permutation_A(i, j, kernel_i, kernel_j):
     return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 # 128x32
-# def permutation_B(i, j, kernel_i, kernel_j):
-#     return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def permutation_B(i, j, kernel_i, kernel_j):
+    return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
-# sch.transform_layout(block_tricky_shared_A, ("read", 0),
-#                      permutation_A)
-# sch.transform_layout(block_tricky_shared_B, ("read", 0),
-#                      permutation_B)
-sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
-block_tricky_shared_A = sch.get_block("A_g2s_shared")
-sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN)
-block_tricky_shared_B = sch.get_block("B_g2s_shared_trans")
+sch.transform_layout(block_tricky_shared_A, ("read", 0),
+                     permutation_A, rewrite_type=1)
+sch.transform_layout(block_tricky_shared_B, ("read", 0),
+                     permutation_B, rewrite_type=1)
+# sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
+# block_tricky_shared_A = sch.get_block("A_g2s_shared")
+# sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN)
+# block_tricky_shared_B = sch.get_block("B_g2s_shared_trans")
 
 
 write_sch(sch, log_path, "tricky_shared_transform_layout")

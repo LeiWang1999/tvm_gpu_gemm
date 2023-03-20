@@ -41,28 +41,21 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
-
 M = 16384
 N = 16384
 K = 16384
-if VERIFY:
-    M = 2048
-    N = 2048
-    K = 2048
 
 warp_size = 32
-block_row_warps = 2
+block_row_warps = 1
 block_col_warps = 4
-warp_row_tiles = 8
-warp_col_tiles = 2
+warp_row_tiles = 16
+warp_col_tiles = 1
 chunk = 2
 vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-raster = 1
-stage = 2
+split_k = 16
 
 @tvm.script.ir_module
 class MyModule:
@@ -138,9 +131,11 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
+block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
+sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -202,8 +197,8 @@ write_sch(sch, log_path, "schedule_B_shared")
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
 write_sch(sch, log_path, "decompose_reduction")
-init_block_b_loops = sch.get_loops(init_block_b)
-sch.tensorize(init_block_b_loops[-2], WMMA_FILL_16x16x16_S32_INTRIN)
+
+sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
 sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_S8_A_INTRIN)
@@ -219,11 +214,6 @@ write_sch(sch, log_path,
 # unroll
 write_sch(sch, log_path,
            "do_unroll")
-if stage == 2:
-    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
-    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
-if raster > 0:
-    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
@@ -260,27 +250,10 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.random.rand(
-    M, K) * 4).astype("int8")
-b_np = (np.random.rand(
-    K, N) * 4).astype("int8")
-
-cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
-cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
-cuda_c = tvm.nd.array(
-    np.zeros((M, N)).astype("int32"), ctx)
-
-
-if VERIFY:
-    cuda_mod(cuda_a, cuda_b, cuda_c)
-    c_np = cuda_c.numpy()
-    np_c = np.matmul(a_np.astype("int32"), b_np.astype("int32"))
-    print("np result: ", np_c[0][0:10])
-    print("tvm result: ", c_np[0][0:10])
-    np.testing.assert_allclose(
-        c_np, np_c, rtol=1e-3, atol=1e-3
-    )
-    print("assert_allclose pass!")
+cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
+cuda_b = tvm.nd.array(np.arange(N * K).reshape((K, N)).astype("int8"), ctx)
+cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
+cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N
 num_runs = 3

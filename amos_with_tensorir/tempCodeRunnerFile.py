@@ -1,0 +1,1 @@
+sch.transform_layout(block_tricky_local_C, ("write", 0),tricky_transform_C)

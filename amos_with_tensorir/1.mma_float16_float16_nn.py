@@ -19,7 +19,11 @@ from intrin.tricky_mma_float16_float16 import (
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-log_path = "progress/amos_with_tensorir/1.mma_float16_float16_nn"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/amos_with_tensorir/" + fname
 count = 0
 
 
@@ -45,16 +49,16 @@ def write_sch(sch, path, fname):
 
 VERIFY = True
 
-M = 1024
-N = 1024
+M = 16384
+N = 16384
 K = 16384
 if VERIFY:
     M = 256
-    N = 256
-    K = 256
+    N = 2048
+    K = 1024
 
 warp_size = 32
-block_row_warps = 2
+block_row_warps = 4
 block_col_warps = 2
 warp_row_tiles = 4
 warp_col_tiles = 4
@@ -186,19 +190,19 @@ write_sch(sch, log_path, "tricky_extract_cache")
 
 
 # 128x32
-# def permutation(i, j, kernel_i, kernel_j):
-#     return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 
-# sch.transform_layout(block_tricky_shared_A, ("read", 0),
-#                      permutation)
-# sch.transform_layout(block_tricky_shared_B, ("read", 0),
-#                      permutation)
+sch.transform_layout(block_tricky_shared_A, ("read", 0),
+                     permutation, rewrite_type=1)
+sch.transform_layout(block_tricky_shared_B, ("read", 0),
+                     permutation, rewrite_type=1)
 
-sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
-block_tricky_shared_A = sch.get_block("A_g2s_shared")
-sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_G2S_16x16_f16_INTRIN)
-block_tricky_shared_B = sch.get_block("B_g2s_shared")
+# sch.tensorize(sch.get_loops(block_tricky_shared_A)[-2], TRICKY_MMA_A_G2S_16x16_f16_INTRIN)
+# block_tricky_shared_A = sch.get_block("A_g2s_shared")
+# sch.tensorize(sch.get_loops(block_tricky_shared_B)[-2], TRICKY_MMA_B_G2S_16x16_f16_INTRIN)
+# block_tricky_shared_B = sch.get_block("B_g2s_shared")
 
 write_sch(sch, log_path, "tricky_shared_transform_layout")
 
@@ -336,12 +340,13 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 
-a_np = (np.random.rand(
-    M, K)).astype("float16")
-b_np = (np.random.rand(
-    K, N)).astype("float16")
-# a_np = np.mod(np.arange(M * K).reshape(M, K), 4).astype("float16")
-# b_np = np.mod(np.arange(N * K).reshape(K, N), 5).astype("float16")
+# a_np = (np.random.rand(
+#     M, K)).astype("float16")
+# b_np = (np.random.rand(
+#     K, N)).astype("float16")
+a_np = np.mod(np.arange(M * K).reshape(M, K), 4).astype("float16") / 5
+b_np = np.mod(np.arange(N * K).reshape(K, N), 5).astype("float16") / 5
+
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
@@ -358,7 +363,7 @@ if VERIFY:
     print("np result: ", np_c[0][0:10])
     print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np_c, rtol=1e0, atol=1e0
+        c_np, np_c, rtol=1e-1, atol=1e-1
     )
     print("assert_allclose pass!")
 

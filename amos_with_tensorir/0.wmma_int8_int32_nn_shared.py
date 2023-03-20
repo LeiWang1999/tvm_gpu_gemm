@@ -13,7 +13,11 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_S32_SHARED_INTRIN,
 )
 
-log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nn_shared"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/amos_with_tensorir/" + fname
 count = 0
 
 
@@ -38,18 +42,18 @@ def write_sch(sch, path, fname):
 
 VERIFY = False
 
-M =16384
-N =16384
-K =16384
+M = 16384
+N = 16384
+K = 16384
 if VERIFY:
     M = 2048
     N = 2048
     K = 2048
 
 warp_size = 32
-block_row_warps = 1
+block_row_warps = 2
 block_col_warps = 4
-warp_row_tiles = 8
+warp_row_tiles = 4
 warp_col_tiles = 2
 chunk = 2
 vec = 16
@@ -175,7 +179,11 @@ block_tricky_shared_B_loops = tricky_extract_cache(
 block_tricky_local_C_loops = tricky_extract_cache(
     block_tricky_local_C, wmma_m, wmma_n)
 
-sch.reverse_compute_at(block_tricky_shared_C, sch.get_loops(block_tricky_local_C)[-4])
+block_tricky_shared_C_loops = tricky_extract_cache(
+    block_tricky_shared_C, wmma_m, wmma_n)
+
+# sch.reverse_compute_at(block_tricky_shared_C, sch.get_loops(block_tricky_local_C)[-4])
+sch.compute_at(block_tricky_local_C, block_tricky_shared_C_loops[-3])
 block_tricky_shared_C_i, block_tricky_shared_j = sch.get_loops(block_tricky_shared_C)[-2:]
 block_tricky_shared_C_fuse = sch.fuse(block_tricky_shared_C_i, block_tricky_shared_j)
 block_tricky_shared_C_outer, block_tricky_shared_tz, block_tricky_shared_ty, block_tricky_shared_tx  = sch.split(block_tricky_shared_C_fuse, factors=[None, block_col_warps, block_row_warps, warp_size])
@@ -293,7 +301,7 @@ if VERIFY:
 
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

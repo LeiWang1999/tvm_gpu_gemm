@@ -459,63 +459,6 @@ def get_mma_store_intrin(dtype, local_size, scope="global"):
 
     return mma_store_desc, mma_store_impl
 
-def get_mma_g2s_16x32_i8_intrin(is_b=False, trans=False, k_dim=16):
-    index_map = A_global_16x32_to_shared_load_16x32_layout
-    if trans:
-        assert is_b, "transpose only support for B"
-    if is_b and trans:
-        index_map = B_global_16x32_to_shared_load_16x32_layout
-    if not is_b:
-        m_dim = M_DIM
-        n_dim = k_dim
-    else:
-        m_dim = N_DIM if trans else k_dim
-        n_dim = k_dim if trans else N_DIM
-    if is_b:
-        block_name = "B_g2s_shared" + ("_trans" if trans else "")
-    else:
-        block_name = "A_g2s_shared"
-        
-    @T.prim_func
-    def mma_g2s_desc(a: T.handle, b: T.handle) -> None:
-        A_global = T.match_buffer(
-            a, [m_dim, n_dim], dtype="int8", scope="global")
-        A_shared = T.match_buffer(b, [m_dim, n_dim], dtype="int8", scope="shared")
-
-        with T.block("root"):
-            T.reads(A_global[0:M_DIM, 0:k_dim])
-            T.writes(A_shared[0:M_DIM, 0:k_dim])
-            for i0, i1 in T.grid(M_DIM, k_dim):
-                with T.block(block_name):
-                    v0, v1 = T.axis.remap("SS", [i0, i1])
-                    T.reads(A_global[v0, v1])
-                    T.writes(A_shared[v0, v1])
-                    A_shared[v0, v1] = A_global[v0, v1]
-
-    @T.prim_func
-    def mma_g2s_impl(a: T.handle, b: T.handle) -> None:
-        s0 = T.var("int32")
-        s1 = T.var("int32")
-        A_global = T.match_buffer(
-            a, [m_dim, n_dim], dtype="int8", scope="global", offset_factor=1)
-        A_shared = T.match_buffer(b, [m_dim, n_dim], dtype="int8", scope="shared", offset_factor=1, strides=[s0, s1])
-
-        with T.block("root"):
-            for i0, i1 in T.grid(M_DIM, k_dim):
-                with T.block(block_name):
-                    v0, v1 = T.axis.remap("SS", [i0, i1])
-                    row, col = T.meta_var(index_map(v0, v1))
-                    T.reads(A_global[row, col])
-                    T.writes(A_shared[v0, v1])
-                    A_shared[v0, v1] = A_global[row, col]
-
-    return mma_g2s_desc, mma_g2s_impl
-
-TRICKY_MMA_A_G2S_16x32_i8_INTRIN = "TRICKY_mma_a_g2s_16x32_i8"
-TensorIntrin.register(TRICKY_MMA_A_G2S_16x32_i8_INTRIN, *get_mma_g2s_16x32_i8_intrin(is_b=False, trans=False, k_dim=32))
-
-TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN = "TRICKY_mma_b_trans_g2s_16x32_i8"
-TensorIntrin.register(TRICKY_MMA_B_TRANS_G2S_16x32_i8_INTRIN, *get_mma_g2s_16x32_i8_intrin(is_b=True, trans=True, k_dim=32))
 
 TRICKY_MMA_fill_16x16_i32_INTRIN = "TRICKY_mma_fill_16x16_i32"
 TensorIntrin.register(TRICKY_MMA_fill_16x16_i32_INTRIN, *

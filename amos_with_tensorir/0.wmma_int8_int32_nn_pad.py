@@ -14,7 +14,11 @@ from tvm.tir.tensor_intrin.cuda import (
     WMMA_STORE_16x16x16_S32_SHARED_INTRIN
 )
 
-log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nn_pad"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/amos_with_tensorir/" + fname
 count = 0
 
 
@@ -301,7 +305,7 @@ cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

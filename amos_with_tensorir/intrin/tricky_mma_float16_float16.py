@@ -47,6 +47,17 @@ def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
     return (i // 8) * 16 + (j // 8) * 8 + i % 8, j % 8
 
 
+def shared_load_16x16_to_A_global_16x16_layout(i, j):
+    # 0, 0-7 -> 0, 0-7
+    # 1, 0-7 -> 1, 0-7
+    # 2, 0-7 -> 2, 0-7
+    # 3, 0-7 -> 3, 0-7
+
+    thread_id = i + (j // 8) * 16
+    row = thread_id // 2
+    col = (thread_id % 2) * 8 + (j % 8)
+    return row, col
+
 def A_global_16x16_to_shared_load_16x16_layout(i, j):
     # 0, 0-7 -> 0, 0-7
     # 1, 0-7 -> 1, 0-7
@@ -57,6 +68,18 @@ def A_global_16x16_to_shared_load_16x16_layout(i, j):
     row = thread_id % 16
     col = (j % 8) + (thread_id // 16) * 8
     return row, col
+
+
+def shared_load_16x16_to_B_global_16x16_layout(i, j):
+    # 0, 0-7 -> 0, 0-7
+    # 1, 0-7 -> 1, 0-7
+    # 2, 0-7 -> 2, 0-7
+
+    thread_id = (i % 8) + (j // 8) * 8 + ((i // 8) % 2) * 64
+    row = thread_id // 2
+    col = (thread_id % 2) * 8 + (j % 8)
+    return row, col
+
 
 
 def B_global_16x16_to_shared_load_16x16_layout(i, j):
@@ -432,7 +455,7 @@ def get_mma_store_intrin(dtype, local_size, scope="global"):
             a, [WARP_SIZE, local_size], dtype=dtype, scope="warp", offset_factor=1
         )
         C = T.match_buffer(
-            c, [M_DIM, N_DIM], dtype=dtype, scope="global", offset_factor=1, strides=[s0, s1]
+            c, [M_DIM, N_DIM], dtype=dtype, scope=scope, offset_factor=1, strides=[s0, s1]
         )
 
         with T.block("root"):
@@ -455,6 +478,66 @@ def get_mma_store_intrin(dtype, local_size, scope="global"):
 
     return mma_store_desc, mma_store_impl
 
+def get_mma_G2S_16x16_f16_intrin(is_b=False, trans=False, k_dim=16):
+    index_map = A_global_16x16_to_shared_load_16x16_layout
+    if trans:
+        assert is_b, "transpose only support for B"
+    if is_b and trans:
+        index_map = B_global_16x16_to_shared_load_16x16_layout
+    if not is_b:
+        m_dim = M_DIM
+        n_dim = k_dim
+    else:
+        m_dim = N_DIM if trans else k_dim
+        n_dim = k_dim if trans else N_DIM
+    if is_b:
+        block_name = "B_g2s_shared" + ("_trans" if trans else "")
+    else:
+        block_name = "A_g2s_shared"
+        
+    @T.prim_func
+    def mma_g2s_desc(a: T.handle, b: T.handle) -> None:
+        A_global = T.match_buffer(
+            a, [m_dim, n_dim], dtype="float16", scope="global")
+        A_shared = T.match_buffer(b, [m_dim, n_dim], dtype="float16", scope="shared")
+
+        with T.block("root"):
+            T.reads(A_global[0:M_DIM, 0:k_dim])
+            T.writes(A_shared[0:M_DIM, 0:k_dim])
+            for i0, i1 in T.grid(M_DIM, k_dim):
+                with T.block(block_name):
+                    v0, v1 = T.axis.remap("SS", [i0, i1])
+                    T.reads(A_global[v0, v1])
+                    T.writes(A_shared[v0, v1])
+                    A_shared[v0, v1] = A_global[v0, v1]
+
+    @T.prim_func
+    def mma_g2s_impl(a: T.handle, b: T.handle) -> None:
+        s0 = T.var("int32")
+        s1 = T.var("int32")
+        A_global = T.match_buffer(
+            a, [m_dim, n_dim], dtype="float16", scope="global", offset_factor=1)
+        A_shared = T.match_buffer(b, [m_dim, n_dim], dtype="float16", scope="shared", offset_factor=1, strides=[s0, s1])
+
+        with T.block("root"):
+            for i0, i1 in T.grid(M_DIM, k_dim):
+                with T.block(block_name):
+                    v0, v1 = T.axis.remap("SS", [i0, i1])
+                    row, col = T.meta_var(index_map(v0, v1))
+                    T.reads(A_global[row, col])
+                    T.writes(A_shared[v0, v1])
+                    A_shared[v0, v1] = A_global[row, col]
+
+    return mma_g2s_desc, mma_g2s_impl
+
+TRICKY_MMA_A_G2S_16x16_f16_INTRIN = "TRICKY_mma_a_G2S_16x16_f16"
+TensorIntrin.register(TRICKY_MMA_A_G2S_16x16_f16_INTRIN, *get_mma_G2S_16x16_f16_intrin(is_b=False, trans=False, k_dim=16))
+
+TRICKY_MMA_B_G2S_16x16_f16_INTRIN = "TRICKY_mma_b_G2S_16x16_f16"
+TensorIntrin.register(TRICKY_MMA_B_G2S_16x16_f16_INTRIN, *get_mma_G2S_16x16_f16_intrin(is_b=True, trans=False, k_dim=16))
+
+TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN = "TRICKY_mma_b_trans_G2S_16x16_f16"
+TensorIntrin.register(TRICKY_MMA_B_TRANS_G2S_16x16_f16_INTRIN, *get_mma_G2S_16x16_f16_intrin(is_b=True, trans=True, k_dim=16))
 
 TRICKY_LDMATRIX_16x16_A_INTRIN = "TRICKY_mma.ldmatrix_16x16_a"
 TensorIntrin.register(TRICKY_LDMATRIX_16x16_A_INTRIN, *
@@ -502,4 +585,10 @@ TRICKY_MMA_store_16x16_f16_global_INTRIN = "TRICKY_mma_store_16x16_f16_global_"
 TensorIntrin.register(
     TRICKY_MMA_store_16x16_f16_global_INTRIN, *
     get_mma_store_intrin("float16", 8, "global")
+)
+
+TRICKY_MMA_store_16x16_f16_shared_INTRIN = "TRICKY_mma_store_16x16_f16_shared_"
+TensorIntrin.register(
+    TRICKY_MMA_store_16x16_f16_shared_INTRIN, *
+    get_mma_store_intrin("float16", 8, "shared")
 )

@@ -6,18 +6,12 @@ import os
 from tvm.tir.tensor_intrin.cuda import (
     WMMA_FILL_16x16x16_S32_INTRIN,
     WMMA_LOAD_16x16x16_S8_A_INTRIN,
-    WMMA_LOAD_16x16x16_S8_B_INTRIN,
     WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN,
-    WMMA_SYNC_16x16x16_s8s8s32_INTRIN,
     WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN,
     WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
 )
 
-# get file name and remove the suffix
-fname = os.path.basename(__file__)
-fname = os.path.splitext(fname)[0]
-# create log path
-log_path = "progress/amos_with_tensorir/" + fname
+log_path = "progress/amos_with_tensorir_quantize_dequantize/0.wmma_int8_int32_nt_no_inline"
 count = 0
 
 
@@ -41,28 +35,28 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
-
 M = 16384
 N = 16384
 K = 16384
-if VERIFY:
-    M = 2048
-    N = 2048
-    K = 2048
 
 warp_size = 32
-block_row_warps = 2
-block_col_warps = 4
-warp_row_tiles = 8
-warp_col_tiles = 2
-chunk = 2
+block_row_warps = 4
+block_col_warps = 1
+warp_row_tiles = 4
+warp_col_tiles = 4
+chunk = 4
 vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-raster = 1
-stage = 2
+split_k = 32
+
+S0 = 0.5
+S1 = 0.1
+S2 = 0.01
+Z0 = 0.0
+Z1 = 0.0
+Z2 = 0.0
 
 @tvm.script.ir_module
 class MyModule:
@@ -70,16 +64,34 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [K, N], dtype="int8")
-        C = T.match_buffer(c, [M, N], dtype="int32")
-
+        B = T.match_buffer(b, [N, K], dtype="int8")
+        C = T.match_buffer(c, [M, N], dtype="int8")
+        QA = T.alloc_buffer([M, K], dtype="int8")
+        QB = T.alloc_buffer([N, K], dtype="int8")
+        QC = T.alloc_buffer([M, N], dtype="int32")
+        
+        for i, j in T.grid(M, K):
+            with T.block("Quantize_A"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                QA[vi, vj] = T.cast(T.round(T.cast(A[vi, vj], "float32") * S0) - Z0, "int8")
+        
+        for i, j in T.grid(N, K):
+            with T.block("Quantize_B"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                QB[vi, vj] = T.cast(T.round(T.cast(B[vi, vj], "float32") * S1) - Z1, "int8")
+            
         for i, j, k  in T.grid(M, N, K):
             with T.block("B"):
                 vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
-                    C[vi, vj] = 0
-                C[vi, vj] = C[vi, vj] + \
-                    A[vi, vk].astype("int32") * B[vk, vj].astype("int32")
+                    QC[vi, vj] = 0
+                QC[vi, vj] = QC[vi, vj] + \
+                    QA[vi, vk].astype("int32") * QB[vj, vk].astype("int32")
+        
+        for i, j in T.grid(M, N):
+            with T.block("DeQuantize_C"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                C[vi, vj] = T.cast(T.cast(QC[vi, vj], "float32") / S2 + Z2, "int8")
 
 
 ir_module = MyModule
@@ -90,11 +102,17 @@ print(ir_module.script())
 
 write_sch(sch, log_path, "original")
 
+block_quantize_a = sch.get_block("Quantize_A")
+block_quantize_b = sch.get_block("Quantize_B")
 block_b = sch.get_block("B")
-block_tricky_A = sch.cache_read(block_b, 0, "global")
+block_dequantize_c = sch.get_block("DeQuantize_C")
+write_sch(sch, log_path, "compute_inline")
+
+block_tricky_A = sch.cache_read(block_quantize_a, 0, "global")
+block_quantize_a_local = sch.cache_read(block_quantize_a, 0, "local")
 block_tricky_shared_A = sch.cache_read(block_b, 0, "shared")
 block_tricky_shared_local_A = sch.cache_read(block_b, 0, "wmma.matrix_a")
-block_tricky_B = sch.cache_read(block_b, 1, "global")
+block_tricky_B = sch.cache_read(block_quantize_b, 0, "global")
 block_tricky_shared_B = sch.cache_read(block_b, 1, "shared")
 block_tricky_shared_local_B = sch.cache_read(block_b, 1, "wmma.matrix_b")
 # block_tricky_C = sch.cache_write(block_b, 0, "global")
@@ -108,7 +126,7 @@ def tricky_transform_A(i, j):
 
 
 def tricky_transform_B(i, j):
-    return (i // wmma_k, j // wmma_n, i % wmma_k, j % wmma_n)
+    return (i // wmma_n, j // wmma_k, i % wmma_n, j % wmma_k)
 
 
 def tricky_transform_C(i, j):
@@ -138,9 +156,11 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
+block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
+sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -155,6 +175,9 @@ sch.compute_at(block_tricky_shared_A, ko)
 sch.compute_at(block_tricky_shared_local_B, ki)
 sch.compute_at(block_tricky_shared_B, ko)
 sch.reverse_compute_at(block_tricky_local_C, j)
+sch.compute_at(block_quantize_a, ki)
+sch.compute_at(block_quantize_b, ki)
+sch.reverse_compute_at(block_dequantize_c, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
 
@@ -202,15 +225,15 @@ write_sch(sch, log_path, "schedule_B_shared")
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
 write_sch(sch, log_path, "decompose_reduction")
-init_block_b_loops = sch.get_loops(init_block_b)
-sch.tensorize(init_block_b_loops[-2], WMMA_FILL_16x16x16_S32_INTRIN)
+
+sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
 sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_S8_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_INTRIN)
-sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_INTRIN)
+sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN)
+sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN)
 sch.tensorize(sch.get_loops(block_tricky_local_C)
               [-2], WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN)
 write_sch(sch, log_path,
@@ -219,11 +242,6 @@ write_sch(sch, log_path,
 # unroll
 write_sch(sch, log_path,
            "do_unroll")
-if stage == 2:
-    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
-    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
-if raster > 0:
-    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
@@ -255,32 +273,21 @@ schedule_tricky_transform(block_tricky_A, vec=vec)
 schedule_tricky_transform(block_tricky_B, vec=vec)
 # schedule_tricky_transform(block_tricky_C, vec=4)
 
+# def schedule_quantize(block):
+#     i, j = sch.get_loops(block)[-2:]
+#     sch.vectorize(fused_vi)
+
+
+
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.random.rand(
-    M, K) * 4).astype("int8")
-b_np = (np.random.rand(
-    K, N) * 4).astype("int8")
-
-cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
-cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
-cuda_c = tvm.nd.array(
-    np.zeros((M, N)).astype("int32"), ctx)
-
-
-if VERIFY:
-    cuda_mod(cuda_a, cuda_b, cuda_c)
-    c_np = cuda_c.numpy()
-    np_c = np.matmul(a_np.astype("int32"), b_np.astype("int32"))
-    print("np result: ", np_c[0][0:10])
-    print("tvm result: ", c_np[0][0:10])
-    np.testing.assert_allclose(
-        c_np, np_c, rtol=1e-3, atol=1e-3
-    )
-    print("assert_allclose pass!")
+cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
+cuda_b = tvm.nd.array(np.arange(N * K).reshape((N, K)).astype("int8"), ctx)
+cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int8"), ctx)
+cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N
 num_runs = 3

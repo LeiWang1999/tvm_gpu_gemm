@@ -4,17 +4,21 @@ import tvm.testing
 from tvm.script import tir as T
 import os
 from tvm.tir.tensor_intrin.cuda import (
-    WMMA_FILL_16x16x16_S32_INTRIN,
-    WMMA_LOAD_16x16x16_S8_A_INTRIN,
-    WMMA_LOAD_16x16x16_S8_B_INTRIN,
-    WMMA_LOAD_16x16x16_S8_B_TRANS_INTRIN,
-    WMMA_SYNC_16x16x16_s8s8s32_INTRIN,
-    WMMA_SYNC_16x16x16_s8s8s32_TRANS_INTRIN,
-    WMMA_STORE_16x16x16_S32_GLOBAL_INTRIN,
-    WMMA_STORE_16x16x16_S32_SHARED_INTRIN
+    WMMA_FILL_16x16x16_F16_INTRIN,
+    WMMA_LOAD_16x16x16_F16_A_INTRIN,
+    WMMA_LOAD_16x16x16_F16_B_INTRIN,
+    WMMA_LOAD_16x16x16_F16_B_TRANS_INTRIN,
+    WMMA_SYNC_16x16x16_f16f16f16_INTRIN,
+    WMMA_SYNC_16x16x16_f16f16f32_TRANS_INTRIN,
+    WMMA_STORE_16x16x16_F16_GLOBAL_INTRIN,
+    WMMA_STORE_16x16x16_F16_SHARED_INTRIN
 )
 
-log_path = "progress/amos_with_tensorir/0.wmma_int8_int32_nn_pad"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/amos_with_tensorir/" + fname
 count = 0
 
 
@@ -38,21 +42,23 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-M = 3136
-N = 64
-K = 576
+M = 225792
+N = 336
+K = 1008
 
 warp_size = 32
-block_row_warps = 1
-block_col_warps = 4
-warp_row_tiles = 8
-warp_col_tiles = 2
+block_row_warps = 2
+block_col_warps = 2
+warp_row_tiles = 4
+warp_col_tiles = 4
 chunk = 2
-vec = 16
+raster = 8
+stage = 2
+
+vec = 8
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-raster = 1
 
 # padding MPAD as the multiple of block_row_warps * warp_row_tiles * wmma_m
 MPAD = (M + block_row_warps * warp_row_tiles * wmma_m - 1) // (
@@ -77,30 +83,30 @@ class MyModule:
     @T.prim_func
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
-        A = T.match_buffer(a, [M, K], dtype="int8")
-        B = T.match_buffer(b, [K, N], dtype="int8")
-        C = T.match_buffer(c, [M, N], dtype="int32")
-        APad = T.alloc_buffer([MPAD, KPAD], dtype="int8")
-        BPad = T.alloc_buffer([KPAD, NPAD], dtype="int8")
-        CPad = T.alloc_buffer([MPAD, NPAD], dtype="int32")
+        A = T.match_buffer(a, [M, K], dtype="float16")
+        B = T.match_buffer(b, [K, N], dtype="float16")
+        C = T.match_buffer(c, [M, N], dtype="float16")
+        APad = T.alloc_buffer([MPAD, KPAD], dtype="float16")
+        BPad = T.alloc_buffer([KPAD, NPAD], dtype="float16")
+        CPad = T.alloc_buffer([MPAD, NPAD], dtype="float16")
         
         for i, k in T.grid(MPAD, KPAD):
             with T.block("APad"):
                 vi, vk = T.axis.remap("SS", [i, k])
-                APad[vi, vk] = T.if_then_else( vi < M and vk < K, A[vi, vk], T.int8(0), dtype="int8")
+                APad[vi, vk] = T.if_then_else( vi < M and vk < K, A[vi, vk], T.float16(0), dtype="float16")
         
         for k, j in T.grid(KPAD, NPAD):
             with T.block("BPad"):
                 vk, vj = T.axis.remap("SS", [k, j])
-                BPad[vk, vj] = T.if_then_else(vk < K and vj < N, B[vk, vj], T.int8(0), dtype="int8")
+                BPad[vk, vj] = T.if_then_else(vk < K and vj < N, B[vk, vj], T.float16(0), dtype="float16")
 
         for i, j, k  in T.grid(MPAD, NPAD, KPAD):
             with T.block("B"):
                 vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
-                    CPad[vi, vj] = 0
+                    CPad[vi, vj] = T.float16(0)
                 CPad[vi, vj] = CPad[vi, vj] + \
-                    APad[vi, vk].astype("int32") * BPad[vk, vj].astype("int32")
+                    APad[vi, vk].astype("float16") * BPad[vk, vj].astype("float16")
         
         for i, j in T.grid(M, N):
             with T.block("CPad"):
@@ -176,8 +182,6 @@ sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
 sch.bind(j, "threadIdx.z")
-if raster > 0:
-    sch.annotate(ko, ann_key="thread_rasterization", ann_val=raster)
 write_sch(sch, log_path, "thread_bind")
 
 
@@ -242,24 +246,30 @@ write_sch(sch, log_path, "schedule_B_shared")
 
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
+init_block_b_loops = sch.get_loops(init_block_b)
 write_sch(sch, log_path, "decompose_reduction")
 
-sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
+sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_F16_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_S8_A_INTRIN)
+sch.tensorize(sch.get_loops(block_tricky_shared_local_A)[-2], WMMA_LOAD_16x16x16_F16_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
-sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_S8_B_INTRIN)
-sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_s8s8s32_INTRIN)
+sch.tensorize(sch.get_loops(block_tricky_shared_local_B)[-2], WMMA_LOAD_16x16x16_F16_B_INTRIN)
+sch.tensorize(kernel_i, WMMA_SYNC_16x16x16_f16f16f16_INTRIN)
 sch.tensorize(sch.get_loops(block_tricky_local_C)
-              [-2], WMMA_STORE_16x16x16_S32_SHARED_INTRIN)
+              [-2], WMMA_STORE_16x16x16_F16_SHARED_INTRIN)
 write_sch(sch, log_path,
            "tensorize")
 
 # unroll
 write_sch(sch, log_path,
            "do_unroll")
+if stage > 1:
+    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, stage - 1])
+    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+if raster > 0:
+    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
@@ -295,13 +305,13 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("int8"), ctx)
-cuda_b = tvm.nd.array(np.arange(N * K).reshape((K, N)).astype("int8"), ctx)
-cuda_c = tvm.nd.array(np.zeros((M, N)).astype("int32"), ctx)
+cuda_a = tvm.nd.array(np.arange(M * K).reshape((M, K)).astype("float16"), ctx)
+cuda_b = tvm.nd.array(np.arange(N * K).reshape((K, N)).astype("float16"), ctx)
+cuda_c = tvm.nd.array(np.zeros((M, N)).astype("float16"), ctx)
 cuda_mod(cuda_a, cuda_b, cuda_c)
 
 num_flops = 2 * M * K * N
-num_runs = 1
+num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(
     cuda_mod.entry_name, ctx, number=num_runs)
 

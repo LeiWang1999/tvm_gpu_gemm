@@ -11,17 +11,13 @@ from intrin.tricky_mma_float16_float16 import (
     TRICKY_MMA_f16f16f16_INTRIN,
     TRICKY_MMA_f16f16f16_TRANS_INTRIN,
     TRICKY_MMA_store_16x16_f16_global_INTRIN,
-    TRICKY_MMA_store_16x16_f16_shared_INTRIN,
     A_global_16x16_to_shared_load_16x16_layout,
+    shared_load_16x16_to_A_global_16x16_layout,
     C_shared_16x16_to_ldmatrix_32x8_layout,
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
 
-# get file name and remove the suffix
-fname = os.path.basename(__file__)
-fname = os.path.splitext(fname)[0]
-# create log path
-log_path = "progress/amos_with_tensorir/" + fname
+log_path = "progress/amos_with_tensorir_avoid_g2g/1.mma_float16_float16_nt"
 count = 0
 
 
@@ -51,26 +47,25 @@ M = 16384
 N = 16384
 K = 16384
 if VERIFY:
-    M = 256
-    N = 2048
-    K = 1024
+    M = 4096
+    N = 4096
+    K = 4096
 
 warp_size = 32
-block_row_warps = 2
-block_col_warps = 4
-warp_row_tiles = 8
-warp_col_tiles = 4
+block_row_warps = 4
+block_col_warps = 1
+warp_row_tiles = 2
+warp_col_tiles = 16
 chunk = 2
+raster = 8
+stage = 2
 vec = 8
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-raster = 16
-stage = 1
-splitk = 1
 
-assert K % splitk == 0
-reduce_k = K // splitk
+
+
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
@@ -79,18 +74,14 @@ class MyModule:
         A = T.match_buffer(a, [M, K], dtype="float16")
         B = T.match_buffer(b, [K, N], dtype="float16")
         C = T.match_buffer(c, [M, N], dtype="float16")
-        TC = T.alloc_buffer([splitk, M, N], dtype="float16", scope="shared")
-        for sk, i, j, k in T.grid(splitk, M, N, reduce_k):
+
+        for i, j, k in T.grid(M, N, K):
             with T.block("B"):
-                vsk, vi, vj, vk = T.axis.remap("SSSR", [sk, i, j, k])
+                vi, vj, vk = T.axis.remap("SSR", [i, j, k])
                 with T.init():
-                    TC[vsk, vi, vj] = T.float16(0.0)
-                TC[vsk, vi, vj] = TC[vsk, vi, vj] + \
-                    A[vi, vsk * reduce_k + vk].astype("float16") * B[vsk * reduce_k + vk, vj].astype("float16")
-        for sk, i, j in T.grid(splitk, M, N):
-            with T.block("C"):
-                vsk, vi, vj = T.axis.remap("SSS", [sk, i, j])
-                T.call_intrin("float16", "tir.atomic_add", T.address_of(C[vi, vj]), TC[vsk, vi, vj])
+                    C[vi, vj] = T.float16(0.0)
+                C[vi, vj] = C[vi, vj] + \
+                    A[vi, vk].astype("float16") * B[vk, vj].astype("float16")
 
 
 ir_module = MyModule
@@ -102,15 +93,11 @@ print(ir_module.script())
 write_sch(sch, log_path, "original")
 
 block_b = sch.get_block("B")
-block_c = sch.get_block("C")
-block_tricky_A = sch.cache_read(block_b, 0, "global")
 block_tricky_shared_A = sch.cache_read(block_b, 0, "shared")
 block_tricky_shared_local_A = sch.cache_read(block_b, 0, "warp")
-block_tricky_B = sch.cache_read(block_b, 1, "global")
 block_tricky_shared_B = sch.cache_read(block_b, 1, "shared")
 block_tricky_shared_local_B = sch.cache_read(block_b, 1, "warp")
 block_tricky_local_C = sch.cache_write(block_b, 0, "warp")
-
 
 write_sch(sch, log_path, "cache_related")
 
@@ -126,24 +113,18 @@ def tricky_transform_B(i, j):
 def tricky_transform_C(i, j):
     return (i // wmma_m, j // wmma_n, i % wmma_m, j % wmma_n)
 
-def tricky_transform_C_sk(sk, i, j):
-    return (sk, i // wmma_m, j // wmma_n, i % wmma_m, j % wmma_n)
 
-
-sch.transform_layout(block_tricky_A, ("write", 0), tricky_transform_A)
-sch.transform_layout(block_tricky_B, ("write", 0), tricky_transform_B)
 sch.transform_layout(block_tricky_shared_A, ("write", 0), tricky_transform_A)
 sch.transform_layout(block_tricky_shared_B, ("write", 0), tricky_transform_B)
 sch.transform_layout(block_tricky_shared_local_A,
                      ("write", 0), tricky_transform_A)
 sch.transform_layout(block_tricky_shared_local_B,
                      ("write", 0), tricky_transform_B)
-sch.transform_layout(block_b, ("write", 0), tricky_transform_C_sk)
-# sch.transform_layout(block_c, ("write", 0), tricky_transform_C)
+sch.transform_layout(block_b, ("write", 0), tricky_transform_C)
 
 write_sch(sch, log_path, "tricky_transform_kernel")
 
-(sk, i, j, k) = sch.get_loops(block_b)
+(i, j, k) = sch.get_loops(block_b)
 i, kernel_i = sch.split(i, factors=[None, wmma_m])
 j, kernel_j = sch.split(j, factors=[None, wmma_n])
 k, kernel_k = sch.split(k, factors=[None, wmma_k])
@@ -157,7 +138,7 @@ sch.reorder(block_i, block_j, i, j, ko, ki, ii,
             jj, kernel_i, kernel_j, kernel_k)
 
 write_sch(sch, log_path, "block_tile")
-sch.bind(sk, "blockIdx.z")
+
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -172,7 +153,6 @@ sch.compute_at(block_tricky_shared_A, ko)
 sch.compute_at(block_tricky_shared_local_B, ki)
 sch.compute_at(block_tricky_shared_B, ko)
 sch.reverse_compute_at(block_tricky_local_C, j)
-sch.reverse_compute_at(block_c, j)
 write_sch(sch, log_path, "cache_read_compute_at")
 
 
@@ -189,34 +169,32 @@ block_tricky_shared_local_A_loops = tricky_extract_cache(
 block_tricky_shared_A_loops = tricky_extract_cache(
     block_tricky_shared_A, wmma_m, wmma_k)
 block_tricky_shared_local_B_loops = tricky_extract_cache(
-    block_tricky_shared_local_B, wmma_k, wmma_n)
+    block_tricky_shared_local_B, wmma_n, wmma_k)
 block_tricky_shared_B_loops = tricky_extract_cache(
-    block_tricky_shared_B, wmma_k, wmma_n)
+    block_tricky_shared_B, wmma_n, wmma_k)
 block_tricky_local_C_loops = tricky_extract_cache(
     block_tricky_local_C, wmma_m, wmma_n)
-# block_c_loops = tricky_extract_cache(
-#     block_c, wmma_m, wmma_n)
-
-sch.reverse_compute_at(block_c, sch.get_loops(block_tricky_local_C)[-4])
-block_tricky_shared_C_i, block_tricky_shared_j = sch.get_loops(block_c)[-2:]
-# block_tricky_shared_C_fuse = sch.fuse(block_tricky_shared_C_i, block_tricky_shared_j)
-# block_tricky_shared_C_outer, block_tricky_shared_tz, block_tricky_shared_ty, block_tricky_shared_tx  = sch.split(block_tricky_shared_C_fuse, factors=[None, block_col_warps, block_row_warps, warp_size])
-# sch.bind(block_tricky_shared_tx, "threadIdx.x")
-# sch.bind(block_tricky_shared_ty, "threadIdx.y")
-# sch.bind(block_tricky_shared_tz, "threadIdx.z")
 
 write_sch(sch, log_path, "tricky_extract_cache")
 
 
 # 128x32
-def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def A_permutation(i, j):
+    kernel_i, kernel_j = A_global_16x16_to_shared_load_16x16_layout(i % wmma_m, j % wmma_k)
+    row = (i // wmma_m) * 16 + kernel_i
+    col = (j // wmma_k) * 16 + kernel_j
+    # *A_global_16x16_to_shared_load_16x16_layout(i % wmma_m, j % wmma_k))
+    return row, col
+
+def B_permutation(i, j, kernel_i, kernel_j):
+    return i, j, *shared_load_16x16_to_A_global_16x16_layout(
+        kernel_i, kernel_j)
 
 
-sch.transform_layout(block_tricky_shared_A, ("read", 0),
-                     permutation)
-sch.transform_layout(block_tricky_shared_B, ("read", 0),
-                     permutation)
+sch.transform_layout(block_tricky_shared_A, ("write", 0),
+                     B_permutation, rewrite_type=2)
+sch.transform_layout(block_tricky_shared_B, ("write", 0),
+                     B_permutation, rewrite_type=2)
 
 write_sch(sch, log_path, "tricky_shared_transform_layout")
 
@@ -240,6 +218,7 @@ write_sch(sch, log_path, "schedule_B_shared")
 
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
+init_block_b_loops = sch.get_loops(init_block_b)
 write_sch(sch, log_path, "decompose_reduction")
 
 # transpose layout
@@ -253,18 +232,15 @@ def index_map_B(j, k, wmma_n, wmma_k):
     return (j, k, *A_B_shared_16x16_to_ldmatrix_32x8_layout(wmma_n, wmma_k),)
 
 
-def index_map_C(sk, i, j, wmma_m, wmma_n):
-    return (sk, i, j, *C_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
+def index_map_C(i, j, wmma_m, wmma_n):
+    return (i, j, *C_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
 
 
 sch.transform_layout(block_tricky_shared_local_A, ("write", 0), index_map_A)
 sch.transform_layout(block_tricky_shared_local_B, ("write", 0), index_map_A)
 sch.transform_layout(block_tricky_local_C, ("read", 0), index_map_C)
-
-# sch.transform_layout(block_c, ("read", 1), index_map_C)
 write_sch(sch, log_path, "transform_layout")
 
-init_block_b_loops = sch.get_loops(init_block_b)
 init_block_b_i, init_block_b_j = sch.get_loops(init_block_b)[-4:-2]
 sch.tensorize(sch.get_loops(init_block_b)
               [-2], TRICKY_MMA_fill_16x16_f16_INTRIN)
@@ -283,7 +259,7 @@ sch.tensorize(sch.get_loops(block_tricky_shared_local_B)
 sch.tensorize(kernel_i, TRICKY_MMA_f16f16f16_INTRIN)
 
 sch.tensorize(sch.get_loops(block_tricky_local_C)
-              [-2], TRICKY_MMA_store_16x16_f16_shared_INTRIN)
+              [-2], TRICKY_MMA_store_16x16_f16_global_INTRIN)
 write_sch(sch, log_path,
           "tensorize")
 
@@ -292,47 +268,25 @@ write_sch(sch, log_path,
 
 def schedule_tricky_transform(block, vec):
     i, j = sch.get_loops(block)[-2:]
-    if K <= 16384:
-        fused_axis = sch.fuse(i, j)
-        # 16384
-        by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
-            fused_axis, factors=[8192, 32, 1, 1, 8, None, vec])
-        # 8192
-        # by, bx, vx, ty, tx, fused_inner, fused_vi = sch.split(
-        #     fused_axis, factors=[256, 256, 4, 2, 8, None, vec])
-        
-        sch.vectorize(fused_vi)
-        sch.bind(by, "blockIdx.y")
-        sch.bind(bx, "blockIdx.x")
-        sch.bind(vx, "vthread.x")
-        sch.bind(ty, "threadIdx.y")
-        sch.bind(tx, "threadIdx.x")
-        # sch.unroll(fused_inner)
-    else:
-        bx, fused_inner, ty, tx, fused_vi = sch.split(
-            j, factors=[1024, None, 32, 32, vec])
-        sch.vectorize(fused_vi)
-        sch.bind(bx, "blockIdx.x")
-        sch.bind(ty, "threadIdx.y")
-        sch.bind(tx, "threadIdx.x")
-    
+    fused_axis = sch.fuse(i, j)
+    bx, fused_inner, ty, tx, fused_vi = sch.split(
+        fused_axis, factors=[1024, None, 32, 32, vec])
+    sch.vectorize(fused_vi)
+    sch.bind(bx, "blockIdx.x")
+    sch.bind(ty, "threadIdx.y")
+    sch.bind(tx, "threadIdx.x")
 
-schedule_tricky_transform(block_tricky_A, vec=vec)
-schedule_tricky_transform(block_tricky_B, vec=vec)
+
+# schedule_tricky_transform(block_tricky_A, vec=vec)
+# schedule_tricky_transform(block_tricky_B, vec=vec)
 # schedule_tricky_transform(block_tricky_C, vec=2)
 
-if stage > 1:
-    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, stage - 1])
-    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
-if raster > 0:
-    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
+# sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
+# sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
 
-block_c_i, block_c_j = sch.get_loops(block_c)[-2:]
-block_c_fused = sch.fuse(block_c_i, block_c_j)
-block_c_ty, block_c_inner, block_c_tx = sch.split(
-    block_c_fused, factors=[block_row_warps, None, warp_size])
-sch.bind(block_c_ty, "threadIdx.y")
-sch.bind(block_c_tx, "threadIdx.x")
+# sch.annotate(k1, ann_key="software_pipeline_stage", ann_val=[0, 0, 1])
+# sch.annotate(k1, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+
 # c_warp_o = sch.get_block("C_warp_o")
 # print(sch.get_loops(c_warp_o)[-1])
 # _, vec = sch.split(sch.get_loops(c_warp_o)[-1], factors=[None, 2])
@@ -350,6 +304,11 @@ sch.bind(block_c_tx, "threadIdx.x")
 # sch.unroll(A_shared_inner)
 # sch.unroll(B_shared_inner)
 
+if stage > 1:
+    sch.annotate(ko, ann_key="software_pipeline_stage", ann_val=[0, 0, stage - 1])
+    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+if raster > 0:
+    sch.annotate(init_block_b_loops[-4], ann_key="thread_rasterization", ann_val=raster)
 
 write_sch(sch, log_path,
           "do_unroll")
@@ -360,21 +319,12 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-a_np = (np.ones(
-    (M, K))).astype("float16")
-# a_np = np.arange(M * K).reshape(M // wmma_m, K //
-#                                 wmma_k, wmma_m, wmma_k).astype("float16")
-# a_np = (np.random.rand
-#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
-
-# b_np = (np.ones(
-#     (K // wmma_k, N // wmma_n,  wmma_k, wmma_n))).astype("float16")
-# b_np = np.arange(N * K).reshape(K // wmma_k, N // wmma_n,  wmma_k, wmma_n).astype("float16")
-
-b_np = np.mod(np.arange(N * K).reshape(K, N), 4).astype("float16")
-# print(b_np)
-# b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
+a_np = (np.random.rand(
+    M, K)).astype("float16")
+b_np = (np.random.rand(
+    K, N)).astype("float16")
+# a_np = np.mod(np.arange(M * K).reshape(M, K), 4).astype("float16")
+# b_np = np.mod(np.arange(N * K).reshape(K, N), 5).astype("float16")
 
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
@@ -388,9 +338,18 @@ cuda_c = tvm.nd.array(
 if VERIFY:
     cuda_mod(cuda_a, cuda_b, cuda_c)
     c_np = cuda_c.numpy()
+    import torch
+    a_torch = torch.tensor(a_np, device="cuda")
+    b_torch = torch.tensor(b_np, device="cuda")
+    c_torch = torch.tensor(c_np, device="cuda")
+    torch.matmul(a_torch, b_torch, out=c_torch)
+    c_torch_np = c_torch.cpu().numpy()
+    print("torch result: ", c_torch_np[0][0:10])
+    print("tvm result: ", c_np[0][0:10])
     np.testing.assert_allclose(
-        c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16")), rtol=1e0, atol=1e0
+        c_np, c_torch_np, rtol=1e0, atol=1e0
     )
+
 
 num_flops = 2 * M * K * N
 num_runs = 3
