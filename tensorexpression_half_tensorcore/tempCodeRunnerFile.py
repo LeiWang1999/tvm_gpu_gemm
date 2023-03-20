@@ -1,0 +1,11 @@
+batch_size = 128
+height = 56
+width = 56
+in_channels = 256
+out_channels = 512
+kernel_h = 3
+kernel_w = 3
+pad_h = 0
+pad_w = 0
+stride_h = 2
+stride_w = 2
