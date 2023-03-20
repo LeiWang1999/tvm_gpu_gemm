@@ -30,7 +30,8 @@ from intrin.tricky_mma_int8_int32 import (
     shared_16x32_to_ldmatrix_32x16_layout,
     shared_16x32_to_ldmatrix_32x16_permutation,
     shared_16x16_to_ldmatrix_32x8_permutation,
-    global_16x32_to_shared_load_16x32_layout,
+    A_global_16x32_to_shared_load_16x32_layout,
+    TRICKY_FIX_WARP_B_TRANS_INTRIN,
 )
 
 log_path = "progress/schedule/tensorize_mma/mma_i8_i32_m16n16k32"
@@ -109,6 +110,8 @@ block_shared_A = sch.cache_read(block_b, 0, "shared")
 block_shared_local_A = sch.cache_read(block_b, 0, "warp")
 block_shared_B = sch.cache_read(block_b, 1, "shared")
 block_shared_local_B = sch.cache_read(block_b, 1, "warp")
+block_shared_local_B_transpose = sch.cache_read(block_b, 1, "warp")
+
 block_local_C = sch.cache_write(block_b, 0, "warp")
 
 write_sch(sch, log_path, "cache_related")
@@ -126,6 +129,7 @@ write_sch(sch, log_path, "thread_bind")
 # cache read A from global memory to shared_memory
 sch.compute_at(block_shared_local_A, j)
 sch.compute_at(block_shared_A, j)
+sch.compute_at(block_shared_local_B_transpose, j)
 sch.compute_at(block_shared_local_B, j)
 sch.compute_at(block_shared_B, j)
 sch.reverse_compute_at(block_local_C, j)
@@ -133,13 +137,17 @@ write_sch(sch, log_path, "cache_read_compute_at")
 
 
 # 128x32
-def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+def A_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
 
 sch.transform_layout(block_shared_A, ("read", 0),
-                     permutation)
+                     A_permutation)
+
+def B_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *A_global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+
 sch.transform_layout(block_shared_B, ("read", 0),
-                     permutation)
+                     B_permutation)
 # sch.transform_layout(block_b, ("read", 0),
 #                      permutation)
 # sch.transform_layout(block_b, ("read", 1),
@@ -189,6 +197,7 @@ def index_map_C(i, j, wmma_m, wmma_n):
 
 sch.transform_layout(block_shared_local_A, ("write", 0), index_map_A)
 sch.transform_layout(block_shared_local_B, ("write", 0), index_map_A)
+sch.transform_layout(block_shared_local_B_transpose, ("write", 0), index_map_A)
 sch.transform_layout(block_local_C, ("read", 0), index_map_C)
 write_sch(sch, log_path, "transform_layout")
 
@@ -201,13 +210,21 @@ block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(
     block_shared_local_A)[-4:-2]
 sch.tensorize(sch.get_loops(block_shared_local_A)
               [-2], TRICKY_LDMATRIX_16x32_A_INTRIN)
-write_sch(sch, log_path,
-          "tensorize_load")
 block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(
     block_shared_local_B)[-4:-2]
 sch.tensorize(sch.get_loops(block_shared_local_B)
               [-2], TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN)
+write_sch(sch, log_path,
+          "tensorize_load")
+
+sch.tensorize(sch.get_loops(block_shared_local_B_transpose)[-2], TRICKY_FIX_WARP_B_TRANS_INTRIN)
+
+write_sch(sch, log_path,
+          "tensorize_fix")
+
 sch.tensorize(kernel_i, TRICKY_MMA_i8i8i32_TRANS_INTRIN)
+write_sch(sch, log_path,
+          "tensorize_mma")
 
 sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_i32_global_INTRIN)
 write_sch(sch, log_path,
@@ -235,18 +252,18 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = (np.ones(
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
-a_np = np.arange(M * K).reshape(M // wmma_m, K //
-                                wmma_k, wmma_m, wmma_k).astype("int8")
+a_np = (np.ones(
+    (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
+# a_np = np.arange(M * K).reshape(M // wmma_m, K //
+#                                 wmma_k, wmma_m, wmma_k).astype("int8")
 # a_np = (np.random.rand
-        # (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
 
-b_np = (np.ones(
-    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
-# b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("int8")
+# b_np = (np.ones(
+#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("int8")
 # b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
+    # N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
 cuda_c = tvm.nd.array(

@@ -4,12 +4,11 @@ Problem definition:
     Consider the following matrix multiplication:
         C = A * B
     where A, B, C are all 2D tensors.
-    A is of shape [M, K, 16, 32]
-    B is of shape [N, K, 16, 32]
+    A is of shape [M, K, 16, 16]
+    B is of shape [N, K, 16, 16]
     C is of shape [M, N, 16, 16]
     The tricky part is that the innermost dimension of A and B are contiguous.
-    We consider a single kernel of  16x16x32
-    16x32 -> 8x32 8x32    
+    We consider a single kernel of  16x16x16
 '''
 import tvm
 from tvm import te
@@ -17,23 +16,20 @@ import numpy as np
 import tvm.testing
 from tvm.script import tir as T
 import os
-from intrin.tricky_mma_int8_int32 import (
-    TRICKY_MMA_fill_16x16_i32_INTRIN,
-    TRICKY_LDMATRIX_16x32_A_INTRIN,
-    TRICKY_LDMATRIX_32x16_B_INTRIN,
-    TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN,
-    TRICKY_MMA_i8i8i32_INTRIN,
-    TRICKY_MMA_i8i8i32_TRANS_INTRIN,
-    TRICKY_MMA_store_16x16_i32_global_INTRIN,
-    shared_16x16_to_ldmatrix_32x8_layout,
-    shared_32x16_to_ldmatrix_32x16_layout,
-    shared_16x32_to_ldmatrix_32x16_layout,
-    shared_16x32_to_ldmatrix_32x16_permutation,
-    shared_16x16_to_ldmatrix_32x8_permutation,
-    global_16x32_to_shared_load_16x32_layout,
+from intrin.tricky_mma_f16_f16 import (
+    TRICKY_MMA_fill_16x16_f16_INTRIN,
+    TRICKY_LDMATRIX_16x16_A_INTRIN,
+    TRICKY_LDMATRIX_16x16_B_INTRIN,
+    TRICKY_LDMATRIX_16x16_B_TRANS_INTRIN,
+    TRICKY_MMA_f16f16f16_INTRIN,
+    TRICKY_MMA_f16f16f16_TRANS_INTRIN,
+    TRICKY_MMA_store_16x16_f16_global_INTRIN,
+    global_16x16_to_shared_load_16x16_layout,
+    C_shared_16x16_to_ldmatrix_32x8_layout,
+    A_B_shared_16x16_to_ldmatrix_32x8_layout,
 )
 
-log_path = "progress/schedule/tensorize_mma/mma_i8_i32_m16n16k32"
+log_path = "progress/schedule/tensorize_mma/mma_f16_f16_m16n16k16_nt"
 count = 0
 
 
@@ -60,7 +56,7 @@ def write_sch(sch, path, fname):
 
 M = 16
 N = 16
-K = 32
+K = 16
 
 warp_size = 32
 block_row_warps = 1
@@ -68,10 +64,10 @@ block_col_warps = 1
 warp_row_tiles = 1
 warp_col_tiles = 1
 chunk = 1
-vec = 16
+vec = 8
 wmma_m = 16
 wmma_n = 16
-wmma_k = 32
+wmma_k = 16
 
 
 @tvm.script.ir_module
@@ -80,21 +76,21 @@ class MyModule:
     def main(a: T.handle, b: T.handle, c: T.handle):
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         A = T.match_buffer(a, [M // wmma_m, K // wmma_k,
-                           wmma_m, wmma_k], dtype="int8")
+                           wmma_m, wmma_k], dtype="float16")
         B = T.match_buffer(b, [N // wmma_n, K // wmma_k,
-                           wmma_n, wmma_k], dtype="int8")
+                           wmma_n, wmma_k], dtype="float16")
         C = T.match_buffer(c, [M // wmma_m, N // wmma_n,
-                           wmma_m, wmma_n], dtype="int32")
+                           wmma_m, wmma_n], dtype="float16")
 
         for ii, jj, kk, i, j, k in T.grid(M // wmma_m, N // wmma_n, K // wmma_k, wmma_m, wmma_n, wmma_k):
             with T.block("B"):
                 vii, vjj, vkk, vi, vj, vk = T.axis.remap(
                     "SSRSSR", [ii, jj, kk, i, j, k])
                 with T.init():
-                    C[vii, vjj, vi, vj] = T.int32(0)
+                    C[vii, vjj, vi, vj] = T.float16(0)
                 C[vii, vjj, vi, vj] = C[vii, vjj, vi, vj] + \
                     A[vii, vkk, vi, vk].astype(
-                        "int32") * B[vjj, vkk, vj, vk].astype("int32")
+                        "float16") * B[vjj, vkk, vj, vk].astype("float16")
 
 
 ir_module = MyModule
@@ -134,16 +130,13 @@ write_sch(sch, log_path, "cache_read_compute_at")
 
 # 128x32
 def permutation(i, j, kernel_i, kernel_j):
-    return (i, j, *global_16x32_to_shared_load_16x32_layout(kernel_i, kernel_j))
+    return (i, j, *global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 sch.transform_layout(block_shared_A, ("read", 0),
                      permutation)
 sch.transform_layout(block_shared_B, ("read", 0),
                      permutation)
-# sch.transform_layout(block_b, ("read", 0),
-#                      permutation)
-# sch.transform_layout(block_b, ("read", 1),
-                    #  permutation)
+
 write_sch(sch, log_path, "transform_layout")
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-2:])
@@ -175,16 +168,14 @@ write_sch(sch, log_path, "decompose_reduction")
 
 # transform layout
 
-
 def index_map_A(i, k, wmma_m, wmma_k):
-    return (i, k, *shared_16x32_to_ldmatrix_32x16_layout(wmma_m, wmma_k))
+    return (i, k, *A_B_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_k))
 
 def index_map_B(j, k, wmma_n, wmma_k):
-    return (j, k, *shared_16x32_to_ldmatrix_32x16_permutation(wmma_n, wmma_k),)
-
+    return (j, k, *A_B_shared_16x16_to_ldmatrix_32x8_layout(wmma_n, wmma_k),)
 
 def index_map_C(i, j, wmma_m, wmma_n):
-    return (i, j, *shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
+    return (i, j, *C_shared_16x16_to_ldmatrix_32x8_layout(wmma_m, wmma_n),)
 
 
 sch.transform_layout(block_shared_local_A, ("write", 0), index_map_A)
@@ -194,22 +185,22 @@ write_sch(sch, log_path, "transform_layout")
 
 init_block_b_i, init_block_b_j = sch.get_loops(init_block_b)[-4:-2]
 sch.tensorize(sch.get_loops(init_block_b)
-              [-2], TRICKY_MMA_fill_16x16_i32_INTRIN)
+              [-2], TRICKY_MMA_fill_16x16_f16_INTRIN)
 write_sch(sch, log_path,
           "tensorize_fill")
 block_shared_local_A_i, block_shared_local_A_j = sch.get_loops(
     block_shared_local_A)[-4:-2]
 sch.tensorize(sch.get_loops(block_shared_local_A)
-              [-2], TRICKY_LDMATRIX_16x32_A_INTRIN)
+              [-2], TRICKY_LDMATRIX_16x16_A_INTRIN)
 write_sch(sch, log_path,
           "tensorize_load")
 block_shared_local_B_i, block_shared_local_B_j = sch.get_loops(
     block_shared_local_B)[-4:-2]
 sch.tensorize(sch.get_loops(block_shared_local_B)
-              [-2], TRICKY_LDMATRIX_16x32_B_TRANS_INTRIN)
-sch.tensorize(kernel_i, TRICKY_MMA_i8i8i32_TRANS_INTRIN)
+              [-2], TRICKY_LDMATRIX_16x16_B_TRANS_INTRIN)
+sch.tensorize(kernel_i, TRICKY_MMA_f16f16f16_TRANS_INTRIN)
 
-sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_i32_global_INTRIN)
+sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_f16_global_INTRIN)
 write_sch(sch, log_path,
           "tensorize")
 
@@ -236,21 +227,21 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 # a_np = (np.ones(
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
+#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("float16")
 a_np = np.arange(M * K).reshape(M // wmma_m, K //
-                                wmma_k, wmma_m, wmma_k).astype("int8")
+                                wmma_k, wmma_m, wmma_k).astype("float16")
 # a_np = (np.random.rand
-        # (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 128).astype("int8")
+#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
 b_np = (np.ones(
-    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
-# b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("int8")
+    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("float16")
+# b_np = np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k).astype("float16")
 # b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("int8")
-cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
-cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
+#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 128).astype("float16")
+cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
+cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(
-    np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("int32"), ctx)
+    np.zeros((M // wmma_m, N // wmma_m, wmma_m, wmma_n)).astype("float16"), ctx)
 
 cuda_mod(cuda_a, cuda_b, cuda_c)
 a_np = a_np.transpose((0, 2, 1, 3)).reshape(M, K)
@@ -259,8 +250,8 @@ c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
 # print(a_np)
 # print(b_np)
 # print(c_np)
-# print(np.matmul(a_np.astype("int32"), b_np.astype("int32").T))
+# print(np.matmul(a_np.astype("float16"), b_np.astype("float16").T))
 
 np.testing.assert_allclose(
-    c_np, np.matmul(a_np.astype("int32"), b_np.astype("int32").T), rtol=1e-4, atol=1e-4
+    c_np, np.matmul(a_np.astype("float16"), b_np.astype("float16").T), rtol=1e-2, atol=1e-2
 )

@@ -63,7 +63,7 @@ def test_gemm():
     tvm.testing.assert_allclose(c.numpy(), np.dot(b_np.T, a_np), rtol=1e1)
 
     num_flops = 2 * nn * nn * nn
-    num_runs = 10
+    num_runs = 30
     timer_f = f.time_evaluator(f.entry_name, dev, number=num_runs)
     t = timer_f(a, b, c, cp).mean
     GFLOPS = num_flops / (t * 1e3) / 1e6

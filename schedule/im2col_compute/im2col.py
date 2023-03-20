@@ -10,17 +10,12 @@ from tvm.script import tir as T
 from tvm import te, tir, topi
 import numpy as np
 import os
-from tvm.tir.tensor_intrin.cuda import (
-    WMMA_SYNC_16x16x16_f16f16f16_INTRIN,
-    WMMA_STORE_16x16x16_F16_GLOBAL_INTRIN,
-    WMMA_STORE_16x16x16_F16_SHARED_INTRIN,
-    WMMA_FILL_16x16x16_F16_INTRIN,
-    WMMA_LOAD_16x16x16_F16_A_INTRIN,
-    WMMA_LOAD_16x16x16_F16_B_INTRIN
-)
 
-
-log_path = "progress/tensorirscript_imma/9.im2col_conv2d_fp16_fp16_tir_fused_g2g"
+# get file name and remove the suffix
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# create log path
+log_path = "progress/tensorirscript_imma/" + fname
 count = 0
 def write_code(code, path, fname):
     global count
@@ -45,7 +40,7 @@ def write_sch(sch, path, fname):
 batch_size = 128
 height = 30
 width = 30
-in_channels = 128
+in_channels = 256
 out_channels = 256
 kernel_h = 3
 kernel_w = 3
@@ -99,11 +94,10 @@ output_shape = (
     output_width,
     out_channels,
 )
-M = output_height * output_width
+M = batch_size * output_height * output_width
 N = out_channels
 K = kernel_h * kernel_w * in_channels
 
-print("B: ", batch_size)
 print("M: ", M)
 print("N: ", N)
 print("K: ", K)

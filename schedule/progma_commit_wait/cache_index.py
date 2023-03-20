@@ -1,10 +1,6 @@
 import tvm
-from tvm import te
-import numpy as np
 import tvm.testing
 from tvm.script import tir as T
-from tvm.tir import TensorIntrin
-from intrin.async_copy import ASYNC_COPY_S8_X16_INTRIN, ASYNC_COPY_F16_X8_INTRIN, InsertAsyncCommitWait
 
 M=64
 N=64
@@ -31,16 +27,10 @@ sch.compute_at(Buffer_A, i)
 ii, i = sch.split(i, factors=[16, None])
 sch.bind(ii, "blockIdx.x")
 sch.bind(i, "threadIdx.x")
-
+sch.annotate(j, "pragma_commit_wait", "")
 shared_loop = sch.get_loops(Buffer_A)[-1]
 shared_loop, shared_loop_v = sch.split(shared_loop, factors=[None, 8])
 
-print(sch.mod["main"].script())
-
-sch.tensorize(shared_loop_v, ASYNC_COPY_F16_X8_INTRIN)
-
-print(sch.mod["main"].script())
-
 ctx = tvm.cuda(0)
 cuda_mod = tvm.build(sch.mod, target="cuda")
-# print(cuda_mod.imported_modules[0].get_source())
+print(cuda_mod.imported_modules[0].get_source())

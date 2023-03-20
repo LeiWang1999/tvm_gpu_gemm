@@ -90,7 +90,70 @@ def shared_16x16_to_ldmatrix_32x8_layout(i, j):
     thread_id = 4 * (i % 8) + (j % 8) // 2
     return thread_id, 4 * (j // 8) + (i // 8) * 2 + (j % 2)
 
+def global_16x16_to_shared_load_16x16_layout(i, j):
+    # 0, 0-7 -> 0, 0-7
+    # 1, 0-7 -> 1, 0-7
+    # 2, 0-7 -> 2, 0-7
+    # 3, 0-7 -> 3, 0-7
+    
+    thread_id = i * 2 + j // 8
+    row = thread_id % 16
+    col = (j % 8) + (thread_id // 16) * 8
+    return row, col
+
+
+def B_global_16x32_to_shared_load_16x32_layout(i, j):
+    # 0, 0-16 -> 0, 0-16
+    # 1, 0-16 -> 1, 0-16
+    # 2, 0-16 -> 2, 0-16
+    # 3, 0-16 -> 3, 0-16
+    # 8, 0-16 -> 0, 16-31
+    """
+        re-orgnize the global memory to shared memory access pattern
+        key context : 
+            j % 16 -> index
+            j // 16 
+            i % 16 -> index
+    """
+    thread_id = i * 2 + j // 16
+    row = (i // 8) * 8 + thread_id % 8
+    col = (j % 16) + 16 * ((thread_id // 8) % 2)
+    # col = 16 * (thread_id // 8) + 16 * ((thread_id // 8) % 2)
+    # if j > 16 and i > 8 or j > 16 and i < 8:
+    # if thread_id >= 8 and thread_id <= 15 or thread_id >= 24 and thread_id <= 31:
+    # thread_id // 8
+    # _t = thread_id // 8
+    # if _t == 1 or _t == 3:
+    #     col = (j % 16) + 16
+
+    # if thread_id >= 8 and thread_id <= 15:
+    #     col = (j % 16) + 16
+    # elif thread_id >= 24 and thread_id <= 31:
+    #     col = (j % 16) + 16
+
+    return row, col
+
+
+def A_global_16x32_to_shared_load_16x32_layout(i, j):
+    # 0, 0-16 -> 0, 0-16
+    # 1, 0-16 -> 1, 0-16
+    # 2, 0-16 -> 2, 0-16
+    # 3, 0-16 -> 3, 0-16
+    """
+        re-orgnize the global memory to shared memory access pattern
+        key context : 
+            j % 16 -> index
+            j // 16 
+            i % 16 -> index
+    """
+    thread_id = i * 2 + j // 16
+    row = thread_id % 16
+    col = (j % 16) + (thread_id // 16) * 16
+    return row, col
+
+
 for m in range(0, 16):
     for n in range(0, 32, 1):
-        print(m * 2 + n // 16, n %
-              16, global_16x32_to_shared_load_16x32(m, n))
+        # print(m * 2 + n // 16, n %
+        #       16, B_global_16x32_to_shared_load_16x32_layout(m, n))
+        print(m, n, B_global_16x32_to_shared_load_16x32_layout(m, n))

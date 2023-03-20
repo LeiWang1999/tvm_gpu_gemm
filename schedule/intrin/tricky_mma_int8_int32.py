@@ -24,12 +24,16 @@ def index_map_shared_16x16_to_ldmatrix_32x8_layout(ind):
     thread_id, local_id = shared_16x16_to_ldmatrix_32x8_layout(i, j)
     return convert([thread_id, local_id])
 
+
 def shared_32x16_to_ldmatrix_32x16_layout(i, j):
     return (i * 2 + j // 16, j % 16)
+
 
 '''
     32 x 16 means we have 32 threads in a warp, and each thread has 16 elements
 '''
+
+
 def shared_16x32_to_ldmatrix_32x16_layout(i, j):
     # convert (i // 8, j // 16, i % 8, j % 16) to a 2d array
     return (i * 2 + j // 16, j % 16)
@@ -62,7 +66,7 @@ def B_global_16x32_to_shared_load_16x32_layout(i, j):
     # 1, 0-16 -> 1, 0-16
     # 2, 0-16 -> 2, 0-16
     # 3, 0-16 -> 3, 0-16
-    # 8, 0-16 -> 1, 17-32
+    # 8, 0-16 -> 0, 16-31
     """
         re-orgnize the global memory to shared memory access pattern
         key context : 
@@ -71,10 +75,23 @@ def B_global_16x32_to_shared_load_16x32_layout(i, j):
             i % 16 -> index
     """
     thread_id = i * 2 + j // 16
-    row = (i // 8) * 8 + thread_id % 8
-    col = (j % 16) + 16 * (T.Or(T.And(thread_id >= 8, thread_id <= 15), T.And(thread_id >= 24, thread_id <= 31)))
+    row = (i // 8) * 8 + (thread_id % 8)
+    col = (j % 16) + 16 * ((thread_id // 8) % 2)
+    # col = 16 * (thread_id // 8) + 16 * ((thread_id // 8) % 2)
+    # if j > 16 and i > 8 or j > 16 and i < 8:
+    # if thread_id >= 8 and thread_id <= 15 or thread_id >= 24 and thread_id <= 31:
+    # thread_id // 8
+    # _t = thread_id // 8
+    # if _t == 1 or _t == 3:
+    #     col = (j % 16) + 16
+
+    # if thread_id >= 8 and thread_id <= 15:
+    #     col = (j % 16) + 16
+    # elif thread_id >= 24 and thread_id <= 31:
+    #     col = (j % 16) + 16
+
     return row, col
-    
+
 def shared_16x32_to_ldmatrix_32x16_permutation(i, j):
     return (j // 16) * 16 + (i // 8) * 8 + i % 8, j % 16
 
@@ -100,11 +117,11 @@ def get_ldmatrix_intrin(k_dim, dtype, is_b, transposed, shared_scope="shared"):
         if transposed:
             shared_offset = (
                 # stride = 32 if int8 , = 16 if fp16
-                lambda tx, stride: 16 * tx 
+                lambda tx, stride: 16 * tx
             )
         else:
             # assert False, "Still not yet implemente none tranposed"
-            def shared_offset(tx, stride): 
+            def shared_offset(tx, stride):
                 return 16 * tx
     else:
         assert (
@@ -116,7 +133,7 @@ def get_ldmatrix_intrin(k_dim, dtype, is_b, transposed, shared_scope="shared"):
             # A dummy offset, ldmatrix cannot be used for int8 + trans case.
             # We still use the ldmatrix intrinsic, but lower it to a manual loop in the codegen.
             # Only the stride information is required.
-            def shared_offset(tx, stride): return 16 * tx 
+            def shared_offset(tx, stride): return 16 * tx
         elif is_b and transposed:
             index_map = shared_16x32_to_ldmatrix_32x16_layout
             # 32x16
@@ -125,7 +142,7 @@ def get_ldmatrix_intrin(k_dim, dtype, is_b, transposed, shared_scope="shared"):
             )
         else:
             index_map = shared_16x32_to_ldmatrix_32x16_layout
-            def shared_offset(tx, stride): return 16 * tx 
+            def shared_offset(tx, stride): return 16 * tx
 
     assert index_map and shared_offset
 
@@ -319,7 +336,7 @@ def get_mma_intrin(k_dim, out_dtype, b_transposed):
                     B.data,
                     B.elem_offset + tx * lift(local_size),
                     C.data,
-                    C.elem_offset + tx * lift(local_size_out) ,
+                    C.elem_offset + tx * lift(local_size_out),
                     False,
                     dtype=out_dtype,
                 )
@@ -471,62 +488,4 @@ TRICKY_MMA_store_16x16_i32_global_INTRIN = "TRICKY_mma_store_16x16_i32_global_"
 TensorIntrin.register(
     TRICKY_MMA_store_16x16_i32_global_INTRIN, *
     get_mma_store_intrin("int32", 8, "global")
-)
-
-
-def get_fix_warp_b_trans(dtype, local_size):
-    # Assume M = N = 16
-    index_map = shared_16x32_to_ldmatrix_32x16_layout
-    @T.prim_func
-    def fix_warp_desc(b: T.handle, bp: T.handle) -> None:
-        B_warp = T.match_buffer(
-            b, [WARP_SIZE, local_size], dtype=dtype, scope="warp")
-        B_warp_permutated = T.match_buffer(
-            bp, [WARP_SIZE, local_size], dtype=dtype, scope="warp")
-        
-
-        with T.block("root"):
-            T.reads(B_warp[0:WARP_SIZE, 0:local_size])
-            T.writes(B_warp_permutated[0:WARP_SIZE, 0:local_size])
-            for i0, i1 in T.grid(local_size, WARP_SIZE):
-                with T.block("B_warp_warp"):
-                    v0, v1 = T.axis.remap("SS", [i0, i1])
-                    mi, mj = T.meta_var(index_map(v0, v1))
-                    T.reads(B_warp[mi, mj])
-                    T.writes(B_warp_permutated[mi, mj])
-                    B_warp_permutated[mi, mj] = B_warp[mi, mj]
-
-    @T.prim_func
-    def fix_warp_impl(b: T.handle, bp: T.handle) -> None:
-
-        B_warp = T.match_buffer(
-            b, [WARP_SIZE, local_size], dtype=dtype, scope="warp")
-        B_warp_permutated = T.match_buffer(
-            bp, [WARP_SIZE, local_size], dtype=dtype, scope="warp")
-
-
-        with T.block("root"):
-            T.reads(B_warp[0:WARP_SIZE, 0:local_size])
-            T.writes(B_warp_permutated[0:WARP_SIZE, 0:local_size])
-            tx = T.env_thread("threadIdx.x")
-            T.launch_thread(tx, WARP_SIZE)
-            for i0 in T.grid(WARP_SIZE):
-                with T.block("B_warp_warp"):
-                    v0 = T.axis.remap("S", [i0])
-                    T.reads(B_warp[v0, 0:local_size])
-                    T.writes(B_warp_permutated[v0, 0:local_size])
-                    B_warp_permutated[v0, 0] = B_warp[v0, 0+8]
-                    B_warp_permutated[v0, 1] = B_warp[v0, 1+8]
-                    B_warp_permutated[v0, 2] = B_warp[v0, 2+8]
-                    B_warp_permutated[v0, 3] = B_warp[v0, 3+8]
-                    B_warp_permutated[v0, 4] = B_warp[v0, 4+8]
-
-
-    return fix_warp_desc, fix_warp_impl
-
-
-TRICKY_FIX_WARP_B_TRANS_INTRIN = "TRICKY_fix_warp_b_local_trans"
-TensorIntrin.register(
-    TRICKY_FIX_WARP_B_TRANS_INTRIN, *
-    get_fix_warp_b_trans("int8", 16)
 )
