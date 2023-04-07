@@ -493,7 +493,6 @@ TensorIntrin.register(
     get_ldmatrix_intrin(16, "float16", True, True)
 )
 
-
 TRICKY_LDMATRIX_16x16_A_INTRIN_DYN = "TRICKY_mma.ldmatrix_16x16_a_DYN"
 TensorIntrin.register(TRICKY_LDMATRIX_16x16_A_INTRIN_DYN, *
                       get_ldmatrix_intrin(16, "float16", False, False, "shared.dyn"))
@@ -528,15 +527,8 @@ TensorIntrin.register(
     get_mma_store_intrin("float16", 8, "global")
 )
 
-TRICKY_MMA_store_16x16_f16_shared_INTRIN = "TRICKY_mma_store_16x16_f16_shared"
+TRICKY_MMA_store_16x16_f16_shared_INTRIN = "TRICKY_mma_store_16x16_f16_shared_"
 TensorIntrin.register(
     TRICKY_MMA_store_16x16_f16_shared_INTRIN, *
     get_mma_store_intrin("float16", 8, "shared")
-)
-
-
-TRICKY_MMA_store_16x16_f16_shared_INTRIN_DYN = "TRICKY_mma_store_16x16_f16_shared_DYN"
-TensorIntrin.register(
-    TRICKY_MMA_store_16x16_f16_shared_INTRIN_DYN, *
-    get_mma_store_intrin("float16", 8, "shared.dyn")
 )
