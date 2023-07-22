@@ -259,7 +259,7 @@ write_sch(sch, log_path,
 
 
 ctx = tvm.cuda(0)
-with tvm.transform.PassContext(config={"tir.use_async_copy": 1, "tir.ptx_ldg128_sts128": True}):
+with tvm.transform.PassContext(config={"tir.use_async_copy": 1, "tir.ptx_ldg128_sts128": False}):
     cuda_mod = tvm.build(sch.mod, target="cuda")
     
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")

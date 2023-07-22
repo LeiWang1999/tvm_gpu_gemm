@@ -43,11 +43,11 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
-M = 256
-N = 8192
-K = 8192
+M = 16384
+N = 16384
+K = 16384
 if VERIFY:
     M = 256
     N = 4096

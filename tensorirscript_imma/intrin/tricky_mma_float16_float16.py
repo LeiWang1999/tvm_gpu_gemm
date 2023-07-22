@@ -48,22 +48,12 @@ def shared_16x16_to_ldmatrix_32x8_permutation(i, j):
 
 
 def shared_load_16x16_to_A_global_16x16_layout(i, j):
-    # 0, 0-7 -> 0, 0-7
-    # 1, 0-7 -> 1, 0-7
-    # 2, 0-7 -> 2, 0-7
-    # 3, 0-7 -> 3, 0-7
-
     thread_id = i + (j // 8) * 16
     row = thread_id // 2
     col = (thread_id % 2) * 8 + (j % 8)
     return row, col
 
 def A_global_16x16_to_shared_load_16x16_layout(i, j):
-    # 0, 0-7 -> 0, 0-7
-    # 1, 0-7 -> 1, 0-7
-    # 2, 0-7 -> 2, 0-7
-    # 3, 0-7 -> 3, 0-7
-
     thread_id = i * 2 + j // 8
     row = thread_id % 16
     col = (j % 8) + (thread_id // 16) * 8
@@ -83,10 +73,6 @@ def shared_load_16x16_to_B_global_16x16_layout(i, j):
 
 
 def B_global_16x16_to_shared_load_16x16_layout(i, j):
-    # 0, 0-7 -> 0, 0-7
-    # 1, 0-7 -> 1, 0-7
-    # 2, 0-7 -> 2, 0-7
-
     thread_id = i * 2 + j // 8
     row = (i // 8) * 8 + (thread_id % 8)
     col = (j % 8) + 8 * ((thread_id // 8) % 2)
@@ -111,12 +97,6 @@ def global_16x32_to_shared_load_16x32_layout(i, j):
     return row, col
 
 
-def shared_16x32_to_ldmatrix_32x16_permutation(i, j):
-    return (j // 16) * 16 + (i // 8) * 8 + i % 8, j % 16
-
-
-# def shared_16x32_to_ldmatrix_32x16_layout(i, j):
-#     return shared_16x32_to_ldmatrix_32x16_permutation(i, j)
 
 def get_ldmatrix_intrin(k_dim, dtype, is_b, transposed, shared_scope="shared"):
     local_size = (M_DIM * k_dim) // WARP_SIZE

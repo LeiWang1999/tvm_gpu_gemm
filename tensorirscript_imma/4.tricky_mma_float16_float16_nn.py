@@ -46,9 +46,9 @@ def write_sch(sch, path, fname):
 
 VERIFY = False
 
-M = 8192
-N = 43008  
-K = 14336
+M = 16384
+N = 16384
+K = 16384
 if VERIFY:
     M = 256
     N = 2048

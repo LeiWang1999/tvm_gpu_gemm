@@ -10,6 +10,9 @@ from tvm.script import tir as T
 from tvm import te, tir, topi
 import numpy as np
 import os
+import sys
+# add path ../..
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 from intrin.tricky_mma_float16_float16 import (
     TRICKY_MMA_fill_16x16_f16_INTRIN,
     TRICKY_LDMATRIX_16x16_A_INTRIN,
@@ -18,12 +21,12 @@ from intrin.tricky_mma_float16_float16 import (
     TRICKY_MMA_f16f16f16_INTRIN,
     TRICKY_MMA_f16f16f16_TRANS_INTRIN,
     TRICKY_MMA_store_16x16_f16_global_INTRIN,
+    TRICKY_MMA_store_16x16_f16_shared_INTRIN,
     A_global_16x16_to_shared_load_16x16_layout,
     B_global_16x16_to_shared_load_16x16_layout,
     C_shared_16x16_to_ldmatrix_32x8_layout,
     A_B_shared_16x16_to_ldmatrix_32x8_layout
 )
-
 
 # get file name and remove the suffix
 fname = os.path.basename(__file__)
@@ -57,10 +60,10 @@ VERIFY = True
 
 # The sizes of inputs and filters
 batch_size = 128
-height = 56
-width = 56
+height = 30
+width = 30
 in_channels = 256
-out_channels = 512
+out_channels = 256
 kernel_h = 3
 kernel_w = 3
 pad_h = 0
@@ -79,13 +82,13 @@ assert in_channels % wmma_m == 0
 assert out_channels % wmma_n == 0
 
 # tuning params
-block_row_warps = 4
-block_col_warps = 1
-warp_row_tiles = 1
-warp_col_tiles = 8
-chunk = 2
+block_row_warps = 1
+block_col_warps = 2
+warp_row_tiles = 8
+warp_col_tiles = 4
+chunk = 1
 stage = 1
-raster = 0
+raster = 1
 
 vec = 8
 warp_size = 32
@@ -96,27 +99,27 @@ print("output_width: ", output_width)
 
 # Input feature map: (N, H, W, IC, n, ic)
 data_shape = (
+    batch_size // wmma_m,
     height,
     width,
-    batch_size // wmma_m,
     in_channels // wmma_k,
     wmma_m,
     wmma_k,
 )
 # Kernel: (H, W, IC, OC, ic, oc)
 kernel_shape = (
+    out_channels // wmma_n,
     kernel_h,
     kernel_w,
-    out_channels // wmma_n,
     in_channels // wmma_k,
     wmma_n,
     wmma_k,
 )
 # Output feature map: (N, H, W, OC, n, oc)
 output_shape = (
+    batch_size // wmma_m,
     output_height,
     output_width,
-    batch_size // wmma_m,
     out_channels // wmma_n,
     wmma_m,
     wmma_n,
@@ -130,22 +133,22 @@ ii = te.reduce_axis((0, wmma_k), name="ii")
 A = te.placeholder(data_shape, name="A", dtype="float16")
 W = te.placeholder(kernel_shape, name="W", dtype="float16")
 APad = te.compute(
-    (height + 2 * pad_h, width + 2 * pad_w, batch_size //
-     wmma_m, in_channels // wmma_k, wmma_m, wmma_k),
-    lambda h, w, n, ic, nn, ii: tvm.tir.if_then_else(
+    (batch_size //
+     wmma_m, height + 2 * pad_h, width + 2 * pad_w, in_channels // wmma_k, wmma_m, wmma_k),
+    lambda n, h, w, ic, nn, ii: tvm.tir.if_then_else(
         tvm.tir.all(h >= pad_h, h < height + pad_h,
                     w >= pad_w, w < width + pad_w),
-        A[h - pad_h, w - pad_w, n, ic, nn, ii],
+        A[n, h - pad_h, w - pad_w, ic, nn, ii],
         tvm.tir.const(0, "float16"),
     ),
     name="APad",
 )
 Conv = te.compute(
     output_shape,
-    lambda h, w, n, o, nn, oo: te.sum(
-        APad[h * stride_h + kh, w * stride_w +
-             kw, n, ic, nn, ii].astype("float16")
-        * W[kh, kw, o, ic, oo, ii].astype("float16"),
+    lambda n, h, w, o, nn, oo: te.sum(
+        APad[n, h * stride_h + kh, w * stride_w +
+             kw,ic, nn, ii].astype("float16")
+        * W[o, kh, kw, ic, oo, ii].astype("float16"),
         axis=[ic, kh, kw, ii],
     ),
     name="Conv",
@@ -163,18 +166,22 @@ block_conv_input_shared = sch.cache_read(block_conv, 0, "shared")
 block_conv_input_frag = sch.cache_read(block_conv, 0, "warp")
 block_conv_weight_shared = sch.cache_read(block_conv, 1, "shared")
 block_conv_weight_frag = sch.cache_read(block_conv, 1, "warp")
+block_conv_output_shared = sch.cache_write(block_conv, 0, "shared")
 block_conv_output_frag = sch.cache_write(block_conv, 0, "warp")
 write_sch(sch, log_path, "cache_related")
 
 sch.compute_inline(block_pad)
 write_sch(sch, log_path, "PadInputInline")
 
-def A_permutation(h, w, n, c, kernel_i, kernel_j):
-    return (h, w, n, c, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+# 128x32
 
 
-def B_permutation(h, w, n, c, kernel_i, kernel_j):
-    return (h, w, n, c, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+def A_permutation(n, h, w, c, kernel_i, kernel_j):
+    return (n, h, w, c, *A_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
+
+
+def B_permutation(n, h, w, c, kernel_i, kernel_j):
+    return (n, h, w, c, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
 
 sch.transform_layout(block_conv_input_shared, ("read", 0),
@@ -182,43 +189,43 @@ sch.transform_layout(block_conv_input_shared, ("read", 0),
 sch.transform_layout(block_conv_weight_shared, ("read", 0),
                      B_permutation)
 
-hc, wc, nc, oc, nnc, ooc, ic, kh, kw, ii = sch.get_loops(block_conv)
-sch.reorder(hc, wc, nc, oc, ic, kh, kw, nnc, ooc, ii)
-write_sch(sch, log_path, "reorder")
-
+nc, hc, wc, oc, nnc, ooc, ic, kh, kw, ii = sch.get_loops(block_conv)
 block_k = sch.fuse(hc, wc)
+sch.bind(block_k, "blockIdx.y")
 nc, nci = sch.split(nc, factors=[None, warp_row_tiles])
 block_i, nc = sch.split(nc, factors=[None, block_row_warps])
 oc, oci = sch.split(oc, factors=[None, warp_col_tiles])
 block_j, oc = sch.split(oc, factors=[None, block_col_warps])
 sch.reorder(block_k, block_i, block_j, nc, oc, nci, oci, nnc, ooc)
 block_i_j = sch.fuse(block_i, block_j)
-sch.bind(block_k, "blockIdx.y")
 sch.bind(block_i_j, "blockIdx.x")
 sch.bind(nc, "threadIdx.y")
 sch.bind(oc, "threadIdx.z")
 write_sch(sch, log_path, "schedule_block_conv")
 
-sch.reverse_compute_at(block_conv_output_frag, block_i_j, preserve_unit_loops=True)
-write_sch(sch, log_path, "reverse_compute_at_output_frag")
+sch.reverse_compute_at(block_conv_output_frag, oc, preserve_unit_loops=True)
+sch.reverse_compute_at(block_conv_output_shared, sch.get_loops(block_conv_output_frag)[-4], preserve_unit_loops=True)
+
 n_1, o_1, nn, oo, ic, kh, kw, ii = sch.get_loops(block_conv)[-8:]
 ko, ki = sch.split(ic, factors=[None, chunk])
 sch.reorder(ko, kh, ki, kw, n_1, o_1, nn, oo, ii)
-# ko = sch.fuse(ko, kh)
+ko = sch.fuse(ko, kh)
+write_sch(sch, log_path, "reverse_compute_at_output_frag")
 
 sch.compute_at(block_conv_input_frag, kw, preserve_unit_loops=True)
+sch.compute_at(block_conv_input_shared, ko, preserve_unit_loops=True)
 sch.compute_at(block_conv_weight_frag, kw, preserve_unit_loops=True)
+sch.compute_at(block_conv_weight_shared, ko, preserve_unit_loops=True)
 write_sch(sch, log_path, "compute_at_input_frag")
 
 
 def schedule_shared_A(block):
-    sch.compute_at(block, kw, preserve_unit_loops=True)
-    A_shared_i, A_shared_j = sch.get_loops(block_conv_input_shared)[-2:]
+    A_shared_i, A_shared_j = sch.get_loops(block)[-2:]
     A_shared_i_j = sch.fuse(A_shared_i, A_shared_j)
     A_shared_i_j, A_shared_vi = sch.split(A_shared_i_j, factors=[None, vec])
     sch.vectorize(A_shared_vi)
     A_shared_fused = sch.fuse(
-        *sch.get_loops(block_conv_input_shared)[-5:-2], A_shared_i_j)
+        *sch.get_loops(block_conv_input_shared)[-6:-2], A_shared_i_j)
     A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx = sch.split(
         A_shared_fused, factors=[block_row_warps, block_col_warps, None, warp_size])
     sch.bind(A_shared_tx, "threadIdx.x")
@@ -227,8 +234,7 @@ def schedule_shared_A(block):
 
 
 def schedule_shared_B(block):
-    sch.compute_at(block, kw, preserve_unit_loops=True)
-    B_shared_fused = sch.fuse(*sch.get_loops(block_conv_weight_shared)[-5:])
+    B_shared_fused = sch.fuse(*sch.get_loops(block)[-6:])
     B_shared_ty, B_shared_tz, B_shared_inner, B_shared_tx, B_shared_vi = sch.split(
         B_shared_fused, factors=[block_row_warps, block_col_warps, None, warp_size, vec])
     sch.vectorize(B_shared_vi)
@@ -236,6 +242,12 @@ def schedule_shared_B(block):
     sch.bind(B_shared_ty, "threadIdx.y")
     sch.bind(B_shared_tz, "threadIdx.z")
 
+def schedule_shared_output(block):
+    o_shared_fused = sch.fuse(*sch.get_loops(block)[-6:])
+    _, o_shared_tx, o_shared_vi = sch.split(
+        o_shared_fused, factors=[None, warp_size, vec])
+    sch.vectorize(o_shared_vi)
+    sch.bind(o_shared_tx, "threadIdx.x")
 
 # schedule the shared memory into A
 schedule_shared_A(block_conv_input_shared)
@@ -244,6 +256,10 @@ write_sch(sch, log_path, "schedule_A_shared")
 # schedule the shared memory into B
 schedule_shared_B(block_conv_weight_shared)
 write_sch(sch, log_path, "schedule_B_shared")
+
+# schedule the output shared memory
+schedule_shared_output(block_conv_output_shared)
+write_sch(sch, log_path, "schedule_output_shared")
 
 init_block_conv = sch.decompose_reduction(block_conv, ko)
 init_block_i, init_block_j = sch.get_loops(init_block_conv)[-4:-2]
@@ -284,35 +300,48 @@ sch.tensorize(nn, TRICKY_MMA_f16f16f16_TRANS_INTRIN)
 write_sch(sch, log_path, "tensorize_wmma_sync")
 
 sch.tensorize(sch.get_loops(block_conv_output_frag)
-              [-2], TRICKY_MMA_store_16x16_f16_global_INTRIN)
+              [-2], TRICKY_MMA_store_16x16_f16_shared_INTRIN)
 write_sch(sch, log_path, "tensorize_store")
 
 # unroll
 write_sch(sch, log_path,
           "do_unroll")
-if stage > 1:
+if stage > 0:
     sch.annotate(ko, ann_key="software_pipeline_stage",
                  ann_val=[0, 0, stage - 1])
     sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+    sch.annotate(ko, ann_key="software_pipeline_async_stages", ann_val=[0])
+
 if raster > 0:
     sch.annotate(init_block_i,
                  ann_key="thread_rasterization", ann_val=raster)
 
-ctx = tvm.cuda(0)
-cuda_mod = tvm.build(sch.mod, target="cuda")
+@tvm.register_func
+def tvm_callback_cuda_postproc(code):
+    if stage == 1:
+        code = code.replace(
+            '''__asm__ __volatile__("cp.async.commit_group;");''', ' ')
+        code = code.replace(
+            '''__asm__ __volatile__("cp.async.wait_group 0;");''', '''__asm__ __volatile__("cp.async.commit_group;");
+            __asm__ __volatile__("cp.async.wait_group 0;");''')
+    # if the next line is a __syncthreads(), replace it with number
+    return code
 
+ctx = tvm.cuda(0)
+with tvm.transform.PassContext(config={"tir.use_async_copy": 1}):
+    cuda_mod = tvm.build(sch.mod, target="cuda")
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 # a_np = np.ones(data_shape).astype("float16")
 # b_np = np.ones(kernel_shape).astype("float16")
 # random init a and b
-# a_np = np.random.uniform(size=data_shape).astype("float16")
-# b_np = np.random.uniform(size=(N // wmma_m, K // wmma_k, wmma_n, wmma_k)).astype("float16")
+a_np = np.random.uniform(size=data_shape).astype("float16")
+b_np = np.random.uniform(size=kernel_shape).astype("float16")
 # aragnge init a and b
-a_np = np.mod(np.arange(0, batch_size * in_channels * height *
-              width), 4).reshape(data_shape).astype("float16")
-b_np = np.mod(np.arange(0, kernel_h * kernel_w * in_channels * out_channels),
-              4).reshape(kernel_shape).astype("float16")
+# a_np = np.mod(np.arange(0, batch_size * in_channels * height *
+#               width), 4).reshape(data_shape).astype("float16")
+# b_np = np.mod(np.arange(0, kernel_h * kernel_w * in_channels * out_channels),
+#               4).reshape(kernel_shape).astype("float16")
 
 c_np = np.zeros(output_shape).astype("float16")
 cuda_a = tvm.nd.array(a_np, ctx)
@@ -324,8 +353,8 @@ cuda_mod(cuda_a, cuda_b, cuda_c)
 if VERIFY:
     # do conv with torch
     import torch
-    # convert a from hwnc1616 into nhwc
-    a_np = np.transpose(a_np, (2, 4, 0, 1, 3, 5)).reshape(
+    # convert a from nhwc1616 into nhwc
+    a_np = np.transpose(a_np, (0, 4, 1, 2, 3, 5)).reshape(
         (batch_size, height, width, in_channels))
     # convert a from nhwc to nchw
     a_np = np.transpose(a_np, (0, 3, 1, 2))
@@ -342,13 +371,13 @@ if VERIFY:
         a_torch, b_torch, stride=(stride_h, stride_w), groups=1)
     c_torch_np = np.transpose(c_torch.cpu().numpy(), (0, 2, 3, 1))
     print(c_torch_np.shape)
-    # convert c from hwno1616 into nhwc
-    c_np = cuda_c.numpy().transpose((2, 4, 0, 1, 3, 5)).reshape(
+    # convert c from nhwc1616 into nhwc
+    c_np = cuda_c.numpy().transpose((0, 4, 1, 2, 3, 5)).reshape(
         (batch_size, output_height, output_width, out_channels)
     )
     print("torch result: ", c_torch_np[0][0][0][0:10])
     print("tvm result: ", c_np[0][0][0][0:10])
-    print("verify result: ", np.allclose(c_torch_np, c_np))
+    np.testing.assert_allclose(c_torch_np, c_np, atol=1e-1, rtol=1e-1, verbose=True)
 
 
 num_runs = 3
@@ -359,3 +388,4 @@ t = timer_cuda_mod(cuda_a, cuda_b, cuda_c).mean
 
 print("task conv2d, average time cost of %d runs = %g ms" %
       (num_runs, t * 1e3))
+

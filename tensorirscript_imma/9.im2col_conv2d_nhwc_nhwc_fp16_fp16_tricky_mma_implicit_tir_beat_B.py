@@ -245,13 +245,13 @@ def permutation(n, h, w, c):
     col = (j // wmma_k) * wmma_k + kernel_j
     return row, col
 
-def A_permutation(n, h, w, c):
-    i, j = permutation(n, h, w, c)
-    fused_i_j = i * K + j
-    return ((fused_i_j // in_channels) // output_width) // output_height, ((fused_i_j // in_channels) // output_width) % output_height, (fused_i_j // in_channels) % output_width, fused_i_j % in_channels,
+# def A_permutation(n, h, w, c):
+#     i, j = permutation(n, h, w, c)
+#     fused_i_j = i * K + j
+#     return ((fused_i_j // in_channels) // output_width) // output_height, ((fused_i_j // in_channels) // output_width) % output_height, (fused_i_j // in_channels) % output_width, fused_i_j % in_channels,
 
-# def A_permutation(i, j, kernel_i, kernel_j):
-#     return (i, j, *shared_load_16x16_to_A_global_16x16_layout(kernel_i, kernel_j))
+def A_permutation(i, j, kernel_i, kernel_j):
+    return (i, j, *shared_load_16x16_to_A_global_16x16_layout(kernel_i, kernel_j))
 
 def B_permutation(i, j, kernel_i, kernel_j):
     return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))

@@ -50,10 +50,10 @@ VERIFY = True
 
 # The sizes of inputs and filters
 batch_size = 128
-height = 28
-width = 28
-in_channels = 128
-out_channels = 128
+height = 42
+width = 42
+in_channels = 1024
+out_channels = 384
 kernel_h = 1
 kernel_w = 1
 pad_h = 0
@@ -110,8 +110,9 @@ output_shape = (
     batch_size // wmma_m,
     output_height,
     output_width,
-    out_channels,
-    wmma_n
+    out_channels // wmma_n,
+    wmma_m,
+    wmma_n,
 )
 M = batch_size * output_height * output_width
 N = out_channels
@@ -142,27 +143,29 @@ class MyModule:
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         # body
         # with T.block("root")
-        A = T.match_buffer(a, (batch_size, height, width, in_channels // wmma_k, wmma_m, wmma_k), dtype="float16")
+        A = T.match_buffer(a, (batch_size // wmma_m, height, width, in_channels // wmma_k, wmma_m, wmma_k), dtype="float16")
         W = T.match_buffer(w, (N // wmma_m, K // wmma_k, wmma_m, wmma_k), dtype="float16")
         Conv = T.match_buffer(conv, (M // wmma_m, N // wmma_n, wmma_m, wmma_n), dtype="float16")
         data_im2col = T.alloc_buffer([M // wmma_m, K // wmma_k, wmma_m, wmma_k], dtype="float16")
 
-        for x, y, z, w in T.grid(M // wmma_m, K // wmma_k, wmma_m, wmma_k):
+        for x, y, xx, yy in T.grid(M // wmma_m, K // wmma_k, wmma_m, wmma_k):
             with T.block("data_im2col"):
-                v_x, v_y, v_z, v_w = T.axis.remap("SSRS", [x, y, z, w])
-                data_im2col[v_x, v_y, v_z, v_w] = A[
-                    v_x // (output_height * output_width),
-                    stride_h * ((v_x % (output_height * output_width)) // output_width) + dilation_h * ((v_y // in_channels) // kernel_w),
-                    stride_w * ((v_x % (output_height * output_width)) % output_width) + dilation_w * ((v_y // in_channels) % kernel_w),
-                    v_z * in_channels + v_w,
-                ]
+                v_x, v_y, v_xx, v_yy = T.axis.remap("SSSS", [x, y, xx, yy])
+                data_im2col[v_x, v_y, v_xx, v_yy] = A[
+                v_x // (output_height * output_width),
+                stride_h * ((v_x % (output_height * output_width)) // output_width) + dilation_h * ((v_y // in_channels) // kernel_w),
+                stride_w * ((v_x % (output_height * output_width)) % output_width) + dilation_w * ((v_y // in_channels) % kernel_w),
+                v_y % in_channels,
+                v_xx,
+                v_yy
+            ]
 
         for xx, yy, kk, x, y, k in T.grid(M // wmma_m, N // wmma_n, K // wmma_k, wmma_m, wmma_n, wmma_k):
             with T.block("Conv"):
                 v_xx, v_yy, v_kk, v_x, v_y, v_k = T.axis.remap("SSRSSR", [xx, yy, kk, x, y, k])
                 with T.init():
                     Conv[v_xx, v_yy, v_x, v_y] = T.float16(0)
-                Conv[v_xx, v_yy, v_x, v_y] = Conv[v_xx, v_yy, v_x, v_y] + data_im2col[v_xx * wmma_m + v_x, v_kk * wmma_k + v_k] * W[v_yy, v_kk, v_y, v_k]
+                Conv[v_xx, v_yy, v_x, v_y] = Conv[v_xx, v_yy, v_x, v_y] + data_im2col[v_xx, v_kk, v_x, v_k] * W[v_yy, v_kk, v_y, v_k]
 
 
 ir_module = MyModule
@@ -171,7 +174,7 @@ print(ir_module)
 sch = tvm.tir.Schedule(ir_module, debug_mask="all")
 write_sch(sch, log_path, "original")
 
-block_pad = sch.get_block("Apad")
+# block_pad = sch.get_block("Apad")
 block_im2col = sch.get_block("data_im2col")
 block_conv = sch.get_block("Conv")
 block_conv_input_shared = sch.cache_read(block_conv, 0 ,"shared")
@@ -181,20 +184,10 @@ block_conv_weight_frag = sch.cache_read(block_conv, 1, "wmma.matrix_b")
 block_conv_output_frag = sch.cache_write(block_conv, 0, "wmma.accumulator")
 write_sch(sch, log_path, "cache_related")
 
-sch.compute_inline(block_pad)
+# sch.compute_inline(block_pad)
 write_sch(sch, log_path, "PadInputInline")
 sch.compute_inline(block_im2col)
 write_sch(sch, log_path, "Im2ColInline")
-
-def tricky_transform_A(i, j):
-    return (i // wmma_m, j // wmma_k, i % wmma_m, j % wmma_k)
-
-
-
-sch.transform_layout(block_conv_input_shared, ("write", 0), tricky_transform_A)
-sch.transform_layout(block_conv_input_frag, ("write", 0), tricky_transform_A)
-
-write_sch(sch, log_path, "transform_layout")
 
 (i, j, k, kernel_i, kernel_j, kernel_k) = sch.get_loops(block_conv)
 
@@ -302,21 +295,35 @@ cuda_mod(cuda_a, cuda_b, cuda_c)
 if VERIFY:
     # do conv with torch
     import torch
+    # convert a from nhwc1616 into nhwc
+    a_np = np.transpose(a_np, (0, 4, 1, 2, 3, 5)).reshape(
+        (batch_size, height, width, in_channels))
     # convert a from nhwc to nchw
     a_np = np.transpose(a_np, (0, 3, 1, 2))
-    a_torch = torch.tensor(a_np, device="cuda")
+    a_torch = torch.tensor(a_np, device="cuda", dtype=torch.float32)
     a_torch = torch.nn.functional.pad(a_torch, (pad_h, pad_h, pad_w, pad_w))
+
+    # convert b from ohwi1616 into ohwi
+    b_np = b_np.reshape(kernel_shape)
+    b_np = np.transpose(b_np, (0, 4, 1, 2, 3, 5)).reshape(
+        (out_channels, kernel_h, kernel_w, in_channels))
     # convert b from ohwi to oihw
-    b_np = b_np.transpose((0, 2, 1, 3)).reshape(kernel_shape)
     b_np = np.transpose(b_np, (0, 3, 1, 2))
-    b_torch = torch.tensor(b_np, device="cuda")
-    c_torch = torch.nn.functional.conv2d(a_torch, b_torch, groups=1)
+    b_torch = torch.tensor(b_np, device="cuda", dtype=torch.float32)
+    c_torch = torch.nn.functional.conv2d(
+        a_torch, b_torch, stride=(stride_h, stride_w), groups=1)
     c_torch_np = np.transpose(c_torch.cpu().numpy(), (0, 2, 3, 1))
-    c_torch_np = c_torch_np.reshape((M, N))
-    c_np = cuda_c.numpy().transpose((0, 2, 1, 3)).reshape(M, N)
-    print("torch result: ", c_torch_np[0][0:10])
-    print("tvm result: ", c_np[0][0:10])
-    print("verify result: ", np.allclose(c_torch_np, c_np))
+    print(c_torch_np.shape)
+
+    # convert c from nhwc1616 into nhwc
+    c_np = cuda_c.numpy().reshape(output_shape).transpose((0, 4, 1, 2, 3, 5)).reshape(
+        (batch_size, output_height, output_width, out_channels)
+    )
+    print("torch result: ", c_torch_np[0][0][0][0:10])
+    print("tvm result: ", c_np[0][0][0][0:10])
+    np.testing.assert_allclose(c_torch_np, c_np, atol=1e-1, rtol=1e-1, verbose=True)
+
+
 
 num_runs = 3
 timer_cuda_mod = cuda_mod.time_evaluator(

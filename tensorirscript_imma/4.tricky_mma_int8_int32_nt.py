@@ -236,19 +236,19 @@ with tvm.transform.PassContext(config={"tir.ptx_ldg128_sts128": False}):
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
 
-a_np = (np.ones
-        ((M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
+# a_np = (np.ones
+#         ((M // wmma_m, K // wmma_k, wmma_m, wmma_k))).astype("int8")
 
-b_np = (np.ones(
-    (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
+# b_np = (np.ones(
+#     (N // wmma_n, K // wmma_k, wmma_n, wmma_k))).astype("int8")
 
-# a_np = (np.random.rand
-#     (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 4).astype("int8")
+a_np = (np.random.rand
+    (M // wmma_m, K // wmma_k, wmma_m, wmma_k) * 4).astype("int8")
 
-# b_np = (np.random.rand(
-#     N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 4).astype("int8")
-# a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("int8")
-# b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("int8")
+b_np = (np.random.rand(
+    N // wmma_n, K // wmma_k, wmma_n, wmma_k) * 4).astype("int8")
+a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("int8")
+b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("int8")
 cuda_a = tvm.nd.array((a_np).astype("int8"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("int8"), ctx)
 cuda_c = tvm.nd.array(

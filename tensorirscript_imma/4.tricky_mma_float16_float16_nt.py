@@ -45,7 +45,7 @@ def write_sch(sch, path, fname):
     write_code(sch.mod.astext(), path, cu_fname)
 
 
-VERIFY = True
+VERIFY = False
 
 M = 16384
 N = 16384
@@ -107,11 +107,11 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
-if splitk > 0:
-    block_k, block_j = sch.split(block_j, factors=[None, splitk])
+# if splitk > 0:
+#     block_k, block_j = sch.split(block_j, factors=[None, splitk])
 write_sch(sch, log_path, "block_tile")
-if splitk > 0:
-    sch.bind(block_k, "blockIdx.z")
+# if splitk > 0:
+#     sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -136,10 +136,10 @@ def A_permutation(i, j, kernel_i, kernel_j):
 def B_permutation(i, j, kernel_i, kernel_j):
     return (i, j, *B_global_16x16_to_shared_load_16x16_layout(kernel_i, kernel_j))
 
-sch.transform_layout(block_shared_A, ("read", 0),
-                     A_permutation)
-sch.transform_layout(block_shared_B, ("read", 0),
-                     B_permutation)
+# sch.transform_layout(block_shared_A, ("read", 0),
+#                      A_permutation)
+# sch.transform_layout(block_shared_B, ("read", 0),
+#                      B_permutation)
 
 A_shared_fused = sch.fuse(*sch.get_loops(block_shared_A)[-4:])
 A_shared_ty, A_shared_tz, A_shared_inner, A_shared_tx, A_shared_vi = sch.split(
@@ -200,6 +200,18 @@ sch.tensorize(sch.get_loops(block_local_C)[-2], TRICKY_MMA_store_16x16_f16_globa
 write_sch(sch, log_path,
            "tensorize")
 
+if splitk > 0:
+    sch.annotate(init_block_b_i,
+                 ann_key="thread_rasterization", ann_val=splitk)
+
+
+@tvm.register_func
+def tvm_callback_cuda_postproc(code):
+    # print(code)
+    code = code.replace("#define TVM_ENBALE_EFFICIENT_SMEM_PTR_CAST 1",
+                        "#define TVM_ENBALE_EFFICIENT_SMEM_PTR_CAST 0")
+    # print(code)
+    return code
 
 # unroll
 # sch.unroll(init_block_b_i)
@@ -223,13 +235,13 @@ cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
-# a_np = (np.random.rand
-#         (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
+a_np = (np.random.rand
+        (M // wmma_m, K // wmma_k, wmma_m, wmma_k)).astype("float16")
 
-# b_np = (np.random.rand
-#         (N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16")
-a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("float16")
-b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("float16")
+b_np = (np.random.rand
+        (N // wmma_n, K // wmma_k, wmma_n, wmma_k)).astype("float16")
+# a_np = np.mod(np.arange(M * K).reshape(M // wmma_m, K // wmma_k, wmma_m, wmma_k), 4).astype("float16")
+# b_np = np.mod(np.arange(N * K).reshape(N // wmma_n, K // wmma_k, wmma_n, wmma_k), 5).astype("float16")
 cuda_a = tvm.nd.array((a_np).astype("float16"), ctx)
 cuda_b = tvm.nd.array((b_np).astype("float16"), ctx)
 cuda_c = tvm.nd.array(

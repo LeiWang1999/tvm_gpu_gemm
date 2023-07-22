@@ -43,17 +43,18 @@ def write_sch(sch, path, fname):
 M = 16384
 N = 16384
 K = 16384
-warp_size = 32
-block_row_warps = 4
-block_col_warps = 1
-warp_row_tiles = 4
-warp_col_tiles = 4
-chunk = 4
 vec = 16
 wmma_m = 16
 wmma_n = 16
 wmma_k = 16
-split_k = 32
+warp_size = 32
+block_row_warps = 2
+block_col_warps = 2
+warp_row_tiles = 4
+warp_col_tiles = 4
+chunk = 4
+stage = 1
+raster = 8
 @tvm.script.ir_module
 class MyModule:
     @T.prim_func
@@ -93,13 +94,9 @@ block_i, i, ii = sch.split(i, factors=[None, block_row_warps, warp_row_tiles])
 block_j, j, jj = sch.split(j, factors=[None, block_col_warps, warp_col_tiles])
 ko, ki = sch.split(k, factors=[None, chunk])
 sch.reorder(block_i, block_j, i, j, ko, ki, ii, jj, kernel_i, kernel_j, kernel_k)
-if split_k > 0:
-    block_k, block_j = sch.split(block_j, factors=[None, split_k])
 
 write_sch(sch, log_path, "block_tile")
 
-if split_k > 0:
-    sch.bind(block_k, "blockIdx.z")
 sch.bind(block_i, "blockIdx.y")
 sch.bind(block_j, "blockIdx.x")
 sch.bind(i, "threadIdx.y")
@@ -139,6 +136,7 @@ write_sch(sch, log_path, "schedule_B_shared")
 
 # decompose reduction
 init_block_b = sch.decompose_reduction(block_b, ko)
+init_block_b_loops = sch.get_loops(init_block_b)
 write_sch(sch, log_path, "decompose_reduction")
 
 sch.tensorize(sch.get_loops(init_block_b)[-2], WMMA_FILL_16x16x16_S32_INTRIN)
@@ -159,8 +157,25 @@ write_sch(sch, log_path,
            "do_unroll")
 
 
+# @tvm.register_func
+# def tvm_callback_cuda_postproc(code):
+#     # print(code)
+#     code = code.replace("#define TVM_ENBALE_EFFICIENT_SMEM_PTR_CAST 1",
+#                         "#define TVM_ENBALE_EFFICIENT_SMEM_PTR_CAST 0")
+#     # print(code)
+#     return code
+if raster > 0:
+    sch.annotate(init_block_b_loops[-4],
+                 ann_key="thread_rasterization", ann_val=raster)
+if stage:
+    sch.annotate(ko, ann_key="software_pipeline_stage",
+                 ann_val=[0, 0, stage - 1])
+    sch.annotate(ko, ann_key="software_pipeline_order", ann_val=[0, 1, 2])
+    sch.annotate(ko, ann_key="software_pipeline_async_stages", ann_val=[0])
+
 ctx = tvm.cuda(0)
-cuda_mod = tvm.build(sch.mod, target="cuda")
+with tvm.transform.PassContext(config={"tir.use_async_copy": 1}):
+    cuda_mod = tvm.build(sch.mod, target="cuda")
 
 write_code(cuda_mod.imported_modules[0].get_source(), log_path, "tmp.cu")
 
